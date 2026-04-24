@@ -34,3 +34,16 @@ Backup link: s1 -- s3
 - Mininet: http://mininet.org
 - POX Controller: https://github.com/noxrepo/pox
 - OpenFlow 1.0 Spec: https://opennetworking.org
+
+Terminal 1:
+cd ~/pox && python3 pox.py log.level --DEBUG openflow.of_01 forwarding.l2_learning
+Terminal 2:
+sudo mn -c && sudo python3 ~/link_failure_topo.py
+Mininet CLI (one at a time):
+pingall
+pingall
+dpctl dump-flows
+link s1 s2 down
+pingall
+link s1 s2 up
+pingallSonnet 4.6
