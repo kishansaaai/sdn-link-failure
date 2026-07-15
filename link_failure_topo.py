@@ -3,7 +3,8 @@ from mininet.net import Mininet
 from mininet.node import RemoteController
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
-from mininet.link import TCLink
+from mininet.link import Link
+from mininet.node import OVSSwitch
 import time
 import re
 
@@ -55,7 +56,13 @@ def measure_ping(net):
 
 def run():
     topo = MeshTopo()
-    net = Mininet(topo=topo, controller=RemoteController('c0', ip='127.0.0.1', port=6633), link=TCLink, autoSetMacs=True)
+    net = Mininet(
+        topo=topo,
+        controller=RemoteController('c0', ip='127.0.0.1', port=6653),
+        switch=lambda name, **kwargs: OVSSwitch(name, protocols='OpenFlow13', **kwargs),
+        link=Link,
+        autoSetMacs=True
+    )
     net.start()
     info('Waiting 10s for controller and discovery...\n')
     time.sleep(10)

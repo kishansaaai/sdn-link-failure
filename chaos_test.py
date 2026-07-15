@@ -26,15 +26,15 @@ import random
 import subprocess
 import sys
 import time
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 
 # Mininet imports are runtime-only (Linux)
 try:
     from mininet.net import Mininet
-    from mininet.node import RemoteController
-    from mininet.link import TCLink
+    from mininet.node import RemoteController, OVSSwitch
+    from mininet.link import Link
     from mininet.log import setLogLevel
     MININET_AVAILABLE = True
 except ImportError:
@@ -59,7 +59,7 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 CONTROLLER_IP   = "127.0.0.1"
-CONTROLLER_PORT = 6633
+CONTROLLER_PORT = 6653
 API_BASE        = "http://127.0.0.1:5000"
 CHAOS_MIN_WAIT  = 5    # seconds before first failure
 CHAOS_MAX_WAIT  = 15   # seconds max between failures
@@ -96,7 +96,57 @@ class ChaosTest:
         self.api_base   = api_base
         self.events: List[dict] = []
         self.recovery_times: List[float] = []
-        self.loss_during: List[float]    = []
+        self.data_plane_outages: List[float] = []
+        self.data_plane_drops: List[int] = []
+        
+    def _start_bg_pings(self, pairs: List[Tuple], interval: float = 0.05) -> dict:
+        procs = {}
+        for h1, h2 in pairs:
+            log_file = f"/tmp/ping_{h1.name}_{h2.name}.log"
+            # start continuous ping in background
+            p = h1.popen(f"ping -i {interval} -D {h2.IP()} > {log_file} 2>&1", shell=True)
+            procs[(h1.name, h2.name)] = p
+        return procs
+
+    def _stop_bg_pings(self, procs: dict) -> None:
+        for p in procs.values():
+            p.terminate()
+            p.wait()
+
+    def _analyze_ping_logs(self, pairs: List[Tuple]) -> Tuple[int, float]:
+        import re
+        max_drops = 0
+        max_outage = 0.0
+        pattern = re.compile(r"\[(\d+\.\d+)\].*icmp_seq=(\d+)")
+        
+        for h1, h2 in pairs:
+            log_file = f"/tmp/ping_{h1.name}_{h2.name}.log"
+            try:
+                with open(log_file, "r") as f:
+                    lines = f.readlines()
+            except Exception:
+                continue
+                
+            last_ts = None
+            last_seq = None
+            
+            for line in lines:
+                m = pattern.search(line)
+                if m:
+                    ts = float(m.group(1))
+                    seq = int(m.group(2))
+                    
+                    if last_ts is not None and last_seq is not None:
+                        drops = seq - last_seq - 1
+                        gap = ts - last_ts
+                        if drops > max_drops:
+                            max_drops = drops
+                        if drops > 0 and gap > max_outage:
+                            max_outage = gap
+                    
+                    last_ts = ts
+                    last_seq = seq
+        return max_drops, max_outage * 1000.0
 
     def run(self) -> dict:
         if not MININET_AVAILABLE:
@@ -108,7 +158,8 @@ class ChaosTest:
         net  = Mininet(
             topo=topo,
             controller=RemoteController("c0", ip=CONTROLLER_IP, port=CONTROLLER_PORT),
-            link=TCLink,
+            switch=lambda name, **kwargs: OVSSwitch(name, protocols='OpenFlow13', datapath='user', **kwargs),
+            link=Link,
             autoSetMacs=True,
         )
         net.start()
@@ -116,9 +167,10 @@ class ChaosTest:
         time.sleep(10)
 
         # Baseline: pingAll before any failures
+        print("[chaos] Waking up network (cold-start)...")
+        net.pingAll(timeout=1)
         print("[chaos] Measuring baseline...")
-        baseline_loss = net.pingAll(timeout=1)
-        net.pingAll(timeout=1)   # second pass to ensure all paths learned
+        baseline_loss = net.pingAll(timeout=1)   # second pass to ensure all paths learned
 
         # Get all switch-to-switch links
         sw_links = [
@@ -126,6 +178,22 @@ class ChaosTest:
             for l in net.links
             if l.intf1.node.name.startswith("s") and l.intf2.node.name.startswith("s")
         ]
+        
+        # Build local graph to find affected host pairs
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "ryu_controller")))
+        from topology_graph import TopologyGraph
+        graph = TopologyGraph()
+        for s1, s2 in sw_links:
+            graph.add_link(int(s1[1:]), 0, int(s2[1:]), 0)
+            
+        host_to_switch = {}
+        for h in net.hosts:
+            for intf in h.intfList():
+                link = intf.link
+                if not link: continue
+                other = link.intf1.node if link.intf2.node == h else link.intf2.node
+                if other.name.startswith('s'):
+                    host_to_switch[h] = int(other.name[1:])
 
         start_ts  = time.time()
         prev_log_len = 0
@@ -137,9 +205,40 @@ class ChaosTest:
             if time.time() - start_ts >= self.duration:
                 break
 
-            # Pick 1-3 random links to kill
-            n_kill = random.randint(1, min(3, len(sw_links)))
+            # Pick 1 random link to kill to isolate single-link recovery
+            n_kill = 1
             targets = random.sample(sw_links, n_kill)
+
+            # Pre-compute affected host pairs before killing links
+            affected_pairs = []
+            failed_edges = [(int(s1[1:]), int(s2[1:])) for s1, s2 in targets]
+            
+            def path_uses_link(path: List[int], a: int, b: int) -> bool:
+                for i in range(len(path) - 1):
+                    if (path[i] == a and path[i+1] == b) or (path[i] == b and path[i+1] == a):
+                        return True
+                return False
+
+            for h1 in net.hosts:
+                for h2 in net.hosts:
+                    if h1 == h2: continue
+                    paths = graph.ecmp_paths(host_to_switch[h1], host_to_switch[h2])
+                    affected = False
+                    for path in paths:
+                        for u, v in failed_edges:
+                            if path_uses_link(path, u, v):
+                                affected = True
+                                break
+                        if affected: break
+                    if affected:
+                        affected_pairs.append((h1, h2))
+
+            # Start background pings for affected pairs (limit to 2 to avoid CPU overload)
+            sample_pairs = random.sample(affected_pairs, min(2, len(affected_pairs))) if affected_pairs else []
+            procs = self._start_bg_pings(sample_pairs, interval=0.005)
+            
+            # Wait for steady state
+            time.sleep(0.5)
 
             for s1, s2 in targets:
                 t_fail = time.time()
@@ -147,10 +246,19 @@ class ChaosTest:
                 net.configLinkStatus(s1, s2, "down")
                 self.events.append({"event": "down", "link": f"{s1}-{s2}", "ts": t_fail})
 
-            # Measure loss immediately after failure
-            loss = net.pingAll(timeout=2)
-            self.loss_during.append(loss)
-            print(f"[chaos] Loss during failure: {loss:.1f}%")
+            # Let pings capture the failure window and recovery
+            time.sleep(2.0)
+            
+            self._stop_bg_pings(procs)
+            
+            if affected_pairs:
+                drops, outage_ms = self._analyze_ping_logs(sample_pairs)
+                self.data_plane_drops.append(drops)
+                if drops > 0:
+                    self.data_plane_outages.append(outage_ms)
+                print(f"[chaos] Data-plane downtime: {drops} drops, max outage = {outage_ms:.1f}ms ({len(affected_pairs)} paths affected, 2 sampled @ 5ms interval)")
+            else:
+                print(f"[chaos] No paths affected by this failure.")
 
             # Fetch recovery log from controller API
             time.sleep(RESTORE_DELAY)
@@ -193,17 +301,20 @@ class ChaosTest:
 
     def _compile_results(self, baseline_loss: float, final_loss: float) -> dict:
         rt = self.recovery_times
+        dt = self.data_plane_outages
+        dr = self.data_plane_drops
         results = {
             "topology": self.topo_name,
             "baseline_loss_pct": baseline_loss,
             "final_loss_pct": final_loss,
             "num_failures": len([e for e in self.events if e["event"] == "down"]),
-            "mean_loss_during_pct": float(np.mean(self.loss_during)) if self.loss_during else 0,
             "recovery_times_ms": rt,
             "mean_recovery_ms":  float(np.mean(rt)) if rt else 0,
             "p50_recovery_ms":   float(np.percentile(rt, 50)) if rt else 0,
             "p95_recovery_ms":   float(np.percentile(rt, 95)) if rt else 0,
             "p99_recovery_ms":   float(np.percentile(rt, 99)) if rt else 0,
+            "data_plane_mean_drops": float(np.mean(dr)) if dr else 0,
+            "data_plane_mean_outage_ms": float(np.mean(dt)) if dt else 0,
         }
         self._print_table(results)
         self._save_results(results)
@@ -214,15 +325,14 @@ class ChaosTest:
         print(f"  CHAOS TEST RESULTS — {r['topology'].upper()}")
         print("=" * 60)
         print(f"  Baseline packet loss :  {r['baseline_loss_pct']:.1f}%")
-        print(f"  Loss during failures :  {r['mean_loss_during_pct']:.1f}% (avg)")
         print(f"  Final packet loss    :  {r['final_loss_pct']:.1f}%")
         print(f"  Failure events       :  {r['num_failures']}")
         print(f"  Recovery samples     :  {len(r['recovery_times_ms'])}")
         if r["recovery_times_ms"]:
-            print(f"  Mean recovery        :  {r['mean_recovery_ms']:.1f} ms")
-            print(f"  p50 recovery         :  {r['p50_recovery_ms']:.1f} ms")
-            print(f"  p95 recovery         :  {r['p95_recovery_ms']:.1f} ms")
-            print(f"  p99 recovery         :  {r['p99_recovery_ms']:.1f} ms")
+            print(f"  Mean recovery (ctrl) :  {r['mean_recovery_ms']:.1f} ms")
+            print(f"  p95 recovery  (ctrl) :  {r['p95_recovery_ms']:.1f} ms")
+        print(f"  Data-plane drops     :  {r['data_plane_mean_drops']:.1f} pkts/failure (avg)")
+        print(f"  Data-plane outage    :  {r['data_plane_mean_outage_ms']:.1f} ms (avg observed gap)")
         print("=" * 60 + "\n")
 
     def _save_results(self, r: dict) -> None:

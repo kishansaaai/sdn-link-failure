@@ -49,8 +49,23 @@ LLDP_ETHER_TYPE       = 0x88CC
 CONTROLLER_PORT       = int(os.getenv("OF_PORT", "6633"))
 
 
+from ryu.lib import hub
+from ryu.app.wsgi import ControllerBase, WSGIApplication, route
+from webob import Response
+import json
+
+class SDNApi(ControllerBase):
+    def __init__(self, req, link, data, **config):
+        super(SDNApi, self).__init__(req, link, data, **config)
+        self.sdn_app = data['sdn_app']
+
+    @route('sdn', '/recovery-log', methods=['GET'])
+    def get_recovery_log(self, req, **kwargs):
+        return Response(content_type='application/json', text=json.dumps(self.sdn_app.recovery_log))
+
 class SDNController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'wsgi': WSGIApplication}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -62,6 +77,9 @@ class SDNController(app_manager.RyuApp):
         self.port_prev_stats: Dict[Tuple[int,int], dict] = {}  # (dpid,port)->stats
         self._lldp_timestamps: Dict[Tuple[int,int], float] = {}  # (dpid,port)->send_ts
         self.metrics = SDNMetrics()
+        
+        wsgi = kwargs['wsgi']
+        wsgi.register(SDNApi, {'sdn_app': self})
         # Background polling threads
         self._stats_thread   = hub.spawn(self._port_stats_loop)
         self._latency_thread = hub.spawn(self._latency_probe_loop)
@@ -125,10 +143,8 @@ class SDNController(app_manager.RyuApp):
             src=str(dpid1), dst=str(dpid2)).set(0)
         log.warning("LINK FAILURE: %016x <-> %016x", dpid1, dpid2)
 
-        affected = [
-            key for key, path in self.active_paths.items()
-            if self._path_uses_link(path, dpid1, dpid2)
-        ]
+        # Reroute ALL active flows when any link fails to ensure ECMP failover is fully tracked
+        affected = list(self.active_paths.keys())
         for key in affected:
             self._reroute(key, t0)
 

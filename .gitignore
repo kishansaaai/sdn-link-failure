@@ -10,3 +10,10 @@ htmlcov/
 benchmarks/*.json
 *.pcap
 
+venv/
+venv310/
+*.log
+patch_*.py
+run_*.sh
+run_*.py
+ryu-manager-patch.py
