@@ -1,2 +1,12 @@
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+htmlcov/
+benchmarks/*.json
+*.pcap
+

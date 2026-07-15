@@ -1,0 +1,107 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "annotations": { "list": [] },
+  "description": "SDN Controller — Live topology, recovery metrics, flow stats",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Controller Role",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "sdn_controller_role",
+        "legendFormat": "{{instance}}"
+      }],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "thresholds": {
+          "steps": [
+            { "color": "orange", "value": 0 },
+            { "color": "green",  "value": 1 }
+          ]
+        },
+        "mappings": [
+          { "type": "value", "options": { "0": { "text": "BACKUP" }, "1": { "text": "PRIMARY" } } }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "title": "Active Flow Rules",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "targets": [{
+        "expr": "sdn_active_flows",
+        "legendFormat": "Flows"
+      }],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Flow Installs / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "targets": [{
+        "expr": "rate(sdn_flow_install_total[1m])",
+        "legendFormat": "Installs/s"
+      }]
+    },
+    {
+      "id": 4,
+      "title": "Link Health",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 4 },
+      "targets": [{
+        "expr": "sdn_link_up",
+        "legendFormat": "{{src}} → {{dst}}",
+        "instant": true
+      }],
+      "options": {
+        "sortBy": [{ "displayName": "Value", "desc": false }]
+      }
+    },
+    {
+      "id": 5,
+      "title": "Recovery Time Distribution (ms)",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [{
+        "expr": "sdn_recovery_time_ms_bucket",
+        "legendFormat": "{{le}}"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "p95 Recovery Time (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, rate(sdn_recovery_time_ms_bucket[5m]))",
+        "legendFormat": "p95"
+      }, {
+        "expr": "histogram_quantile(0.50, rate(sdn_recovery_time_ms_bucket[5m]))",
+        "legendFormat": "p50"
+      }]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "tags": ["sdn", "openflow", "ryu"],
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "title": "SDN Controller Dashboard",
+  "uid": "sdn-controller-v2",
+  "version": 1
+}

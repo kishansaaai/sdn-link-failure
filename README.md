@@ -1,72 +1,177 @@
-# SDN Link Failure Detection and Dijkstra Dynamic Rerouting
+# SDN Link-Failure Recovery with Dijkstra Rerouting + Controller HA
 
-[![Tests](https://github.com/yourusername/sdn-link-failure/actions/workflows/tests.yml/badge.svg)](https://github.com/yourusername/sdn-link-failure/actions/workflows/tests.yml)
+[![Tests](https://github.com/kishansaaai/sdn-link-failure/actions/workflows/tests.yml/badge.svg)](https://github.com/kishansaaai/sdn-link-failure/actions/workflows/tests.yml)
+[![Lint](https://github.com/kishansaaai/sdn-link-failure/actions/workflows/lint.yml/badge.svg)](https://github.com/kishansaaai/sdn-link-failure/actions/workflows/lint.yml)
+[![codecov](https://codecov.io/gh/kishansaaai/sdn-link-failure/branch/main/graph/badge.svg)](https://codecov.io/gh/kishansaaai/sdn-link-failure)
+
+---
+
+## What This Is — And Why It's Interesting
+
+Most SDN student projects implement a learning switch: flood until you learn a MAC, then install a rule. When a link fails, either the flows time out and the switch relearns, or you wipe all flow tables and start over. Both approaches take 2–8 seconds per failure event.
+
+This project does something different: it builds a **live, metric-weighted graph of the entire network topology** using LLDP discovery, runs **Dijkstra's algorithm** to pre-install optimal paths end-to-end (not switch-by-switch), and on any link failure **surgically replaces only the broken paths** — proactively installing new OF rules before the next packet arrives. The result is **sub-100ms data-plane failover** measured at the OpenFlow message level.
+
+It also adds the one thing almost no student SDN project touches: **controller high availability** — a primary and a backup controller sharing topology state via Redis, with automatic leader election when the primary dies.
+
+---
 
 ## Architecture
 
-This project implements a topology-aware, intelligent SDN controller using POX and Mininet. 
-Unlike a simple flood-and-relearn layer-2 switch, this controller leverages POX's `openflow.discovery` component (which uses LLDP packets) to actively build and maintain a live graph of the entire network topology.
-
-### Why this is not just a flood-and-relearn switch:
-- **Proactive Graph Building**: Instead of only learning a path when a packet is sent, it maps the whole network's switch adjacencies.
-- **Shortest Path via Dijkstra**: When a new flow needs routing, the controller calculates the exact shortest path from source switch to destination switch using Dijkstra's algorithm, and proactively installs `ofp_flow_mod` rules along the entire path.
-- **Instant Rerouting on Failure**: When a `LinkEvent` down occurs, the controller identifies exactly which active flows used the failed link. It instantly deletes those rules, recalculates a new shortest path avoiding the failure, and pushes the new rules. This happens before the next packet arrives, ensuring sub-second failover.
-
-## Topology
-A 5-switch, 6-host mesh/ring topology ensures multiple alternative routes exist for dynamic path selection.
-
 ```
-       s1 -- s2 -- s3
-     /  |      \    |  
-   /    |       \   |   
-s5 ---- | ------- s4
+┌─────────────────── Control Plane ───────────────────────┐
+│                                                          │
+│   ┌─────────────────────┐     ┌──────────────────────┐  │
+│   │   Ryu Primary       │     │   Ryu Backup         │  │
+│   │   :6633 / :8000     │     │   :6634 / :8001      │  │
+│   │   role=PRIMARY      │────▶│   role=WATCHING      │  │
+│   └─────────┬───────────┘     └──────────┬───────────┘  │
+│             │ heartbeat TTL               │ polls        │
+│             ▼                             ▼              │
+│          ┌──────────────── Redis ───────────────────┐    │
+│          │  sdn:heartbeat (TTL=5s)                  │    │
+│          │  sdn:topology_state (JSON graph)          │    │
+│          └──────────────────────────────────────────┘    │
+│                                                          │
+│  Prometheus :9090  →  Grafana :3000                      │
+└─────────────────────┬────────────────────────────────────┘
+                      │ OpenFlow 1.3
+         ┌────────────▼────────────┐
+         │   Mininet Data Plane    │
+         │   s1─s2─s3─s4─s5─s1    │
+         │       cross-links       │
+         │  h1 h2  h3  h4  h5 h6  │
+         └─────────────────────────┘
 ```
-*(Hosts not pictured: h1, h2 on s1; h3 on s3; h4 on s4; h5, h6 on s5)*
 
-## Setup & Execution
+**HA Design (3 sentences):** The primary controller writes a heartbeat key with a 5-second TTL to Redis every 2 seconds. The backup controller polls this key every second; if it expires, the backup loads the last-synced topology JSON from Redis and promotes itself to primary using OpenFlow role negotiation. This separates **control-plane failover time** (~2 s for TTL detection + state load) from **data-plane failover time** (~40 ms for path recomputation and flow installation).
 
-### Requirements
-- Ubuntu Linux
-- Mininet: `sudo apt-get install mininet`
-- POX: `git clone https://github.com/noxrepo/pox.git`
-- Python requirements: `pip install flask pytest`
+---
 
-### Steps
+## Key Results
 
-1. Copy controller files `link_failure_recovery.py` and `monitor_api.py` to `pox/ext/` (or ensure they are in the POX path).
-2. Terminal 1 - Start controller with discovery:
+| Topology | Failures | Mean Failover | p50 | p95 | Loss During Failure |
+|---|---|---|---|---|---|
+| Ring (4 sw) | 8 | **38 ms** | 35 ms | 68 ms | 4.2% |
+| Mesh (5 sw) | 11 | **42 ms** | 40 ms | 75 ms | 5.8% |
+| Fat-tree (k=4) | 14 | **55 ms** | 48 ms | 98 ms | 7.1% |
+
+**vs. naive flood-and-relearn:** 2–8 seconds recovery, 100% loss until relearn.
+
+> Full results and regeneration instructions: [`benchmarks/results.md`](benchmarks/results.md)
+
+---
+
+## How to Run (One Command)
+
+> Requires Docker with Linux kernel support (Ubuntu/Debian recommended).
+
 ```bash
-cd ~/pox
-python3 pox.py log.level --DEBUG openflow.discovery openflow.spanning_tree --no-flood link_failure_recovery
+git clone https://github.com/kishansaaai/sdn-link-failure
+cd sdn-link-failure
+docker compose up
 ```
-3. Terminal 2 - Start topology and automated ping script:
+
+| Service | URL |
+|---|---|
+| Grafana Dashboard | http://localhost:3000 (admin/admin) |
+| Prometheus | http://localhost:9090 |
+| REST API — Topology | http://localhost:5000/topology |
+| REST API — Recovery Log | http://localhost:5000/recovery-log |
+| Primary Metrics | http://localhost:8000/metrics |
+
+### Bare-metal (Ubuntu + Mininet)
+
 ```bash
-sudo python3 link_failure_topo.py
+# Terminal 1 — Primary controller
+ryu-manager --observe-links ryu_controller/sdn_controller.py
+
+# Terminal 2 — Mininet
+sudo python3 topologies/mesh_topo.py
+
+# Run chaos test
+sudo python3 chaos_test.py --topo mesh --duration 60
 ```
 
-## REST API Monitoring
+---
 
-The controller exposes a Flask-based REST API on port `5000` to monitor live topology and failovers.
-- **View Topology**: `curl http://localhost:5000/topology`
-- **View Recovery Log**: `curl http://localhost:5000/recovery-log`
+## REST API
 
-## Failover Metrics
+The controller exposes a lightweight Flask API in a background thread:
 
-The automated test script will kill the `s1-s2` link and output the failover times. Due to the proactive Dijkstra routing, failover is nearly instantaneous.
+```bash
+# Live topology as JSON
+curl http://localhost:5000/topology
 
-**Example Measured Recovery Times:**
+# Measured failover events
+curl http://localhost:5000/recovery-log
+```
+
+**Example recovery-log output:**
 ```json
 [
   {
-    "link_pair": "10:00:00:00:00:01->10:00:00:00:00:03",
+    "src_mac": "00:00:00:00:00:01",
+    "dst_mac": "00:00:00:00:00:05",
+    "reason": "failure",
+    "recovery_ms": 42.3,
     "new_path": [1, 5, 4, 3],
-    "recovery_ms": 42.5,
-    "ts": 1700000000.123
+    "ts": 1720000000.123
   }
 ]
 ```
-*Average Failover time: ~42ms*
+
+---
+
+## Why This Is Not a Flood-and-Relearn Switch
+
+| Capability | L2 Learning Switch | This Controller |
+|---|---|---|
+| Path computation | Per-hop, reactive | Global Dijkstra, proactive |
+| Failure response | Wait for timeout / wipe all rules | Surgical delete + instant reinstall |
+| Recovery time | 2–8 seconds | 35–55 ms |
+| Link cost metric | None (hop count) | Latency + bandwidth + loss rate |
+| Traffic engineering | None | Proactive rebalancing at >75% utilization |
+| Load balancing | None | ECMP via OF1.3 Group Tables |
+| Controller HA | None | Primary/backup with Redis state sync |
+| Observability | None | Prometheus + Grafana, per-link gauges |
+
+---
+
+## Design Decisions & Tradeoffs
+
+**Why Ryu over ONOS / OpenDaylight?**  
+ONOS and ODL are production-grade platforms with clustered state, intent frameworks, and hundreds of thousands of lines of code. For a research/portfolio project validating a specific algorithm, Ryu gives direct access to the OpenFlow message layer with minimal overhead. ONOS would be the right choice if you needed to operate at carrier scale with real hardware.
+
+**Why Redis over etcd / ZooKeeper for state sync?**  
+etcd and ZooKeeper provide strong consistency guarantees (Raft consensus) which are essential when many controllers must agree on cluster state. Here, we have exactly two nodes (primary + one backup) and the state is eventually consistent by design — if the primary dies between two heartbeats, the backup may load topology state that is up to 2 seconds stale, which is acceptable because switches will re-advertise link events on reconnect. Redis's TTL-based expiry maps perfectly to the heartbeat pattern with zero configuration overhead.
+
+**What I'd do differently at larger scale:**  
+At 500+ switches, the centralized Dijkstra computation on every topology change becomes a bottleneck. I'd move to a hierarchical controller design (ONOS clusters with regional sub-controllers), switch to a distributed graph store (Apache TinkerPop / JanusGraph), and implement segment routing (SR-MPLS or SRv6) to encode paths in packet headers rather than installing per-flow rules on every switch.
+
+---
+
+## Future Work
+
+- **P4 dataplane**: Move failure detection into the dataplane using P4 registers and INT (In-band Network Telemetry) — eliminates the controller round-trip entirely for detection.
+- **Real hardware**: Test on a Zodiac FX OpenFlow switch or BMv2 software switch with a physical NIC for accurate latency measurements.
+- **Inter-domain failover**: BGP-like route redistribution between SDN islands — relevant for multi-datacenter deployments.
+- **ML-based traffic prediction**: Replace the fixed 75% utilization threshold with an LSTM model predicting link congestion 30 seconds ahead.
+
+---
 
 ## Proof of Execution
-See `cn-screenshots.pdf` in this repository for original screenshots.
-New screenshots showing the JSON `recovery-log` output demonstrate the real-time failover logging.
+
+- **`benchmarks/results.md`** — measured failover times across three topologies
+- **`cn-screenshots.pdf`** — original v1 POX prototype screenshots
+- **`legacy/`** — preserved v1 POX controller showing the engineering evolution
+
+---
+
+## References
+
+- [Ryu SDN Framework](https://ryu-sdn.org/)
+- [OpenFlow 1.3 Specification](https://opennetworking.org/wp-content/uploads/2014/10/openflow-spec-v1.3.0.pdf)
+- [Mininet](http://mininet.org)
+- [Dijkstra's Algorithm — Original Paper](https://doi.org/10.1007/BF01386390)
+- [Fat-Tree Topology — Al-Fares et al. 2008](https://dl.acm.org/doi/10.1145/1402958.1402967)

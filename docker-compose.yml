@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  ryu-primary:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: >
+      ryu-manager
+        --observe-links
+        ryu_controller/sdn_controller.py
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - OF_PORT=6633
+      - CONTROLLER_ROLE=primary
+    ports:
+      - "6633:6633"    # OpenFlow
+      - "8000:8000"    # Prometheus metrics
+      - "5000:5000"    # REST API
+    depends_on:
+      - redis
+    privileged: true
+    network_mode: host
+    restart: unless-stopped
+
+  ryu-backup:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: >
+      ryu-manager
+        --observe-links
+        ryu_controller/sdn_controller.py
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - OF_PORT=6634
+      - CONTROLLER_ROLE=backup
+    ports:
+      - "6634:6634"    # OpenFlow (backup listens on different port)
+      - "8001:8000"    # Prometheus metrics (backup)
+    depends_on:
+      - redis
+      - ryu-primary
+    privileged: true
+    network_mode: host
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - ryu-primary
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./docker/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ./docker/grafana/dashboard.json:/etc/grafana/provisioning/dashboards/dashboard.json:ro
+      - ./docker/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped

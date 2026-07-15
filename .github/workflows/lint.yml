@@ -1,0 +1,42 @@
+name: Lint & Type Check
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy numpy prometheus_client
+
+      - name: Run ruff (linter)
+        run: ruff check ryu_controller/ ha/ --ignore E501
+
+      - name: Run mypy (type checker)
+        run: |
+          mypy ryu_controller/topology_graph.py \
+               ha/backup.py \
+               ha/state_sync.py \
+               --ignore-missing-imports \
+               --no-strict-optional
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -f docker/Dockerfile -t sdn-controller:test .
