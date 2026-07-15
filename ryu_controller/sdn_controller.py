@@ -29,6 +29,7 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.topology import event as topo_event
 from ryu.topology.api import get_all_link, get_all_switch
 
+from ryu_controller.group_allocator import GroupIdAllocator
 from ryu_controller.metrics_exporter import SDNMetrics
 from ryu_controller.topology_graph import LinkMetrics, TopologyGraph
 
@@ -53,7 +54,8 @@ class SDNController(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.graph     = TopologyGraph()
+        self.graph      = TopologyGraph()
+        self.group_alloc = GroupIdAllocator()
         self.dpid_conns: Dict[int, object]  = {}   # dpid -> datapath
         self.active_paths: Dict[Tuple, List[int]] = {}  # (src_mac, dst_mac) -> [dpid...]
         self.recovery_log: List[dict]        = []
@@ -434,7 +436,7 @@ class SDNController(app_manager.RyuApp):
                 actions=actions,
             ))
 
-        group_id = hash(key) & 0xFFFFFFFF
+        group_id = self.group_alloc.allocate(key)
         dp.send_msg(par.OFPGroupMod(
             datapath=dp,
             command=ofp.OFPGC_ADD,

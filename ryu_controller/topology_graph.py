@@ -170,9 +170,20 @@ class TopologyGraph:
         # Simple BFS-style alternative: try removing each edge of the best path
         for i in range(len(best) - 1):
             u, v = best[i], best[i + 1]
+            # Save the full edge state (both directions) BEFORE probing.
+            # remove_link() deletes both adj[u][v] and adj[v][u]; once both
+            # are gone there is no way to reconstruct port/metric info from
+            # graph state alone, so we snapshot it ourselves instead of
+            # relying on add_link_from_state's best-effort recovery.
+            saved_uv = self.adj.get(u, {}).get(v)
+            saved_vu = self.adj.get(v, {}).get(u)
             self.remove_link(u, v)
             alt = self.weighted_dijkstra(src, dst)
-            self.add_link_from_state(u, v)   # restore
+            # Restore exactly what was there before, unconditionally.
+            if saved_uv is not None:
+                self.adj.setdefault(u, {})[v] = saved_uv
+            if saved_vu is not None:
+                self.adj.setdefault(v, {})[u] = saved_vu
             if alt and self._path_cost(alt) <= threshold:
                 if alt not in found:
                     found.append(alt)
@@ -185,19 +196,16 @@ class TopologyGraph:
                    for i in range(len(path) - 1))
 
     def add_link_from_state(self, dpid1: int, dpid2: int) -> None:
-        """Restore a link that was temporarily removed (used by ECMP)."""
-        # Only restore if we still have the port info cached in one direction
-        e1 = self.adj.get(dpid1, {}).get(dpid2)
-        e2 = self.adj.get(dpid2, {}).get(dpid1)
-        if e1 is None and e2 is None:
-            return   # truly gone — can't restore without port info
-        # If one direction survived, reconstruct the other
-        if e1 and not e2:
-            port1, metrics = e1
-            self.adj[dpid2][dpid1] = (port1, metrics)
-        elif e2 and not e1:
-            port2, metrics = e2
-            self.adj[dpid1][dpid2] = (port2, metrics)
+        """Unused — kept for reference. See ecmp_paths() for the real restore logic.
+
+        The original best-effort restore is unsafe: remove_link() deletes both
+        adj[u][v] and adj[v][u] atomically, so by the time this is called both
+        directions are already gone and the 'if e1 is None and e2 is None: return'
+        guard always fires, silently leaving the edge deleted.  ecmp_paths() now
+        snapshots both directions before calling remove_link and restores them
+        unconditionally without going through this function.
+        """
+        pass  # no-op
 
     # ------------------------------------------------------------------
     # Path → port sequence
