@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import heapq
 import logging
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -36,12 +37,19 @@ class LinkMetrics:
     loss_rate: float = 0.0           # fraction [0, 1] from port drops
     utilization: float = 0.0         # fraction [0, 1] of link capacity in use
 
+    def __post_init__(self):
+        values = (self.latency_ms, self.bandwidth_mbps, self.loss_rate, self.utilization)
+        if any(not math.isfinite(v) or v < 0 for v in values):
+            raise ValueError("Link metrics must be finite and nonnegative")
+        if self.loss_rate > 1 or self.utilization > 1:
+            raise ValueError("Loss and utilization must be fractions in [0, 1]")
+
     def cost(self, alpha: float = DEFAULT_ALPHA,
              beta: float  = DEFAULT_BETA,
              gamma: float = DEFAULT_GAMMA) -> float:
         """Composite cost: lower is better."""
-        bw_term = 1.0 / max(self.bandwidth_mbps, 0.001)
-        return alpha * self.latency_ms + beta * bw_term + gamma * self.loss_rate
+        bw_term = 1.0 / max(self.bandwidth_mbps * (1 - self.utilization), 0.001)
+        return max(alpha * self.latency_ms + beta * bw_term + gamma * self.loss_rate, 1e-9)
 
 
 @dataclass
@@ -70,6 +78,8 @@ class TopologyGraph:
         self.beta  = beta
         self.gamma = gamma
         self.ecmp_tolerance = ecmp_tolerance
+        if any(not math.isfinite(v) or v < 0 for v in (alpha, beta, gamma, ecmp_tolerance)):
+            raise ValueError("Routing weights and tolerance must be finite and nonnegative")
 
     # ------------------------------------------------------------------
     # Graph mutations
@@ -96,6 +106,12 @@ class TopologyGraph:
         self.adj.get(dpid1, {}).pop(dpid2, None)
         self.adj.get(dpid2, {}).pop(dpid1, None)
         log.debug("Graph: removed link %016x <-> %016x", dpid1, dpid2)
+
+    def remove_switch(self, dpid: int) -> None:
+        for neighbor in list(self.adj.get(dpid, {})):
+            self.remove_link(dpid, neighbor)
+        self.adj.pop(dpid, None)
+        self.hosts = {mac: loc for mac, loc in self.hosts.items() if loc.dpid != dpid}
 
     def update_metrics(self, dpid1: int, dpid2: int,
                        metrics: LinkMetrics) -> None:
@@ -124,6 +140,8 @@ class TopologyGraph:
     def weighted_dijkstra(self, src: int, dst: int
                           ) -> Optional[List[int]]:
         """Return the lowest-cost path [src, ..., dst] or None."""
+        if src not in self.adj or dst not in self.adj:
+            return None
         if src == dst:
             return [src]
         dist: Dict[int, float] = {src: 0.0}
@@ -155,57 +173,46 @@ class TopologyGraph:
         return path
 
     def ecmp_paths(self, src: int, dst: int) -> List[List[int]]:
-        """
-        Return all paths whose cost is within ecmp_tolerance of the best.
-        Uses a K-shortest-path style approach (Yen's first pass simplified).
-        At most 4 paths are returned to keep group-table entries bounded.
-        """
-        best = self.weighted_dijkstra(src, dst)
-        if best is None:
-            return []
-        best_cost = self._path_cost(best)
-        threshold = best_cost * (1.0 + self.ecmp_tolerance)
+        """Up to four near-equal paths in a strictly destination-decreasing DAG.
 
-        found: List[List[int]] = [best]
-        # Simple BFS-style alternative: try removing each edge of the best path
-        for i in range(len(best) - 1):
-            u, v = best[i], best[i + 1]
-            # Save the full edge state (both directions) BEFORE probing.
-            # remove_link() deletes both adj[u][v] and adj[v][u]; once both
-            # are gone there is no way to reconstruct port/metric info from
-            # graph state alone, so we snapshot it ourselves instead of
-            # relying on add_link_from_state's best-effort recovery.
-            saved_uv = self.adj.get(u, {}).get(v)
-            saved_vu = self.adj.get(v, {}).get(u)
-            self.remove_link(u, v)
-            alt = self.weighted_dijkstra(src, dst)
-            # Restore exactly what was there before, unconditionally.
-            if saved_uv is not None:
-                self.adj.setdefault(u, {})[v] = saved_uv
-            if saved_vu is not None:
-                self.adj.setdefault(v, {})[u] = saved_vu
-            if alt and self._path_cost(alt) <= threshold:
-                if alt not in found:
-                    found.append(alt)
-            if len(found) >= 4:
-                break
+        Every next hop decreases the shortest distance to the destination, so
+        merging paths into per-switch SELECT groups cannot introduce a loop.
+        Searches never mutate the live graph.
+        """
+        if src not in self.adj or dst not in self.adj:
+            return []
+        distances = {dst: 0.0}
+        heap = [(0.0, dst)]
+        while heap:
+            cost, node = heapq.heappop(heap)
+            if cost > distances[node]:
+                continue
+            for neighbor in self.adj[node]:
+                candidate = cost + self._link_cost(neighbor, node)
+                if candidate < distances.get(neighbor, float("inf")):
+                    distances[neighbor] = candidate
+                    heapq.heappush(heap, (candidate, neighbor))
+        if src not in distances:
+            return []
+        limit = distances[src] * (1 + self.ecmp_tolerance) + 1e-12
+        pending = [(0.0, [src])]
+        found: List[List[int]] = []
+        while pending and len(found) < 4:
+            cost, path = heapq.heappop(pending)
+            node = path[-1]
+            if node == dst:
+                found.append(path)
+                continue
+            for neighbor in sorted(self.adj[node]):
+                remaining = distances.get(neighbor, float("inf"))
+                next_cost = cost + self._link_cost(node, neighbor)
+                if remaining < distances[node] and next_cost + remaining <= limit:
+                    heapq.heappush(pending, (next_cost, path + [neighbor]))
         return found
 
     def _path_cost(self, path: List[int]) -> float:
         return sum(self._link_cost(path[i], path[i + 1])
                    for i in range(len(path) - 1))
-
-    def add_link_from_state(self, dpid1: int, dpid2: int) -> None:
-        """Unused — kept for reference. See ecmp_paths() for the real restore logic.
-
-        The original best-effort restore is unsafe: remove_link() deletes both
-        adj[u][v] and adj[v][u] atomically, so by the time this is called both
-        directions are already gone and the 'if e1 is None and e2 is None: return'
-        guard always fires, silently leaving the edge deleted.  ecmp_paths() now
-        snapshots both directions before calling remove_link and restores them
-        unconditionally without going through this function.
-        """
-        pass  # no-op
 
     # ------------------------------------------------------------------
     # Path → port sequence
@@ -247,14 +254,20 @@ class TopologyGraph:
             mac: {"dpid": loc.dpid, "port": loc.port}
             for mac, loc in self.hosts.items()
         }
-        return {"adj": adj_serial, "hosts": hosts_serial}
+        return {"adj": adj_serial, "hosts": hosts_serial,
+                "routing": {"alpha": self.alpha, "beta": self.beta,
+                            "gamma": self.gamma, "ecmp_tolerance": self.ecmp_tolerance}}
 
     @classmethod
     def from_dict(cls, data: dict,
-                  alpha: float = DEFAULT_ALPHA,
-                  beta:  float = DEFAULT_BETA,
-                  gamma: float = DEFAULT_GAMMA) -> "TopologyGraph":
-        g = cls(alpha=alpha, beta=beta, gamma=gamma)
+                  alpha: Optional[float] = None,
+                  beta: Optional[float] = None,
+                  gamma: Optional[float] = None) -> "TopologyGraph":
+        routing = data.get("routing", {})
+        g = cls(alpha=alpha if alpha is not None else routing.get("alpha", DEFAULT_ALPHA),
+                beta=beta if beta is not None else routing.get("beta", DEFAULT_BETA),
+                gamma=gamma if gamma is not None else routing.get("gamma", DEFAULT_GAMMA),
+                ecmp_tolerance=routing.get("ecmp_tolerance", ECMP_COST_TOLERANCE))
         for dpid_str, neighbors in data.get("adj", {}).items():
             dpid = int(dpid_str)
             g.add_switch(dpid)

@@ -1,110 +1,85 @@
-"""
-test_leader_election.py — Unit tests for the HA leader election state machine.
-
-Runs without Redis by using a mock StateSync.
-"""
-import time
+"""Exercise real Lua leases, ownership fencing, failure and recovery."""
+from unittest.mock import Mock
+import fakeredis
 import pytest
-from unittest.mock import MagicMock, patch
-
-from ha.backup import LeaderElection, POLL_INTERVAL
-
-
-class MockStateSync:
-    def __init__(self, primary_alive: bool = True):
-        self._alive = primary_alive
-        self.heartbeats: list = []
-
-    def is_primary_alive(self) -> bool:
-        return self._alive
-
-    def pull_state(self):
-        return {"graph": {"adj": {}, "hosts": {}}, "recovery_log": [], "ts": time.time()}
-
-    def write_heartbeat(self, instance_id: str) -> None:
-        self.heartbeats.append(instance_id)
+from redis.exceptions import ConnectionError
+from ha.backup import LeaderElection
+from ha.state_sync import StateSync, HEARTBEAT_KEY
 
 
-def make_election(primary_alive: bool = True, on_promote=None):
-    election = LeaderElection(on_promote=on_promote, instance_id="test-backup")
-    election.sync = MockStateSync(primary_alive=primary_alive)
-    return election
+@pytest.fixture
+def client():
+    return fakeredis.FakeRedis(decode_responses=True)
 
 
-# ---------------------------------------------------------------------------
-# State machine tests
-# ---------------------------------------------------------------------------
+def test_only_one_owner_and_generation_increases(client):
+    a, b = StateSync(client), StateSync(client)
+    assert a.acquire("a") == 1
+    assert b.acquire("b") == 0
+    assert not b.renew("b")
+    b.release("b")
+    assert a.read_heartbeat() == "a"
+    a.release("a")
+    assert b.acquire("b") == 2
 
-def test_initial_state_is_watching():
-    e = make_election(primary_alive=True)
-    assert e.state == LeaderElection.WATCHING
+
+def test_state_is_fenced(client):
+    sync = StateSync(client)
+    sync.acquire("a")
+    assert sync.push_state("a", {"graph": {}, "intents": [["a", "b"]]})
+    assert not sync.push_state("b", {"graph": {"corrupt": True}})
+    assert sync.pull_state()["intents"] == [["a", "b"]]
+    assert client.ttl(HEARTBEAT_KEY) > 0
 
 
-def test_is_not_primary_while_watching():
-    e = make_election(primary_alive=True)
+def test_promote_renew_demote_and_takeover(client):
+    promoted, demoted = Mock(), Mock()
+    a = LeaderElection(StateSync(client), "a", promoted, demoted)
+    b = LeaderElection(StateSync(client), "b")
+    a.tick()
+    b.tick()
+    assert a.is_primary and not b.is_primary
+    promoted.assert_called_once_with(None)
+    a.tick()
+    promoted.assert_called_once()
+    client.delete(HEARTBEAT_KEY)  # simulate TTL expiration
+    b.tick()
+    a.tick()
+    assert b.is_primary and not a.is_primary
+    demoted.assert_called_once()
+    assert b.generation > a.generation
+
+
+def test_redis_failure_is_not_permission_to_promote():
+    sync = Mock()
+    sync.acquire.side_effect = ConnectionError("offline")
+    e = LeaderElection(sync)
+    e.tick()
+    assert not e.is_primary
+    assert "offline" in e.last_error
+
+
+def test_failed_renewal_withdraws_existing_master():
+    sync, demote = Mock(), Mock()
+    sync.acquire.return_value = 1
+    sync.pull_state.return_value = None
+    e = LeaderElection(sync, on_demote=demote)
+    e.tick()
+    sync.renew.side_effect = ConnectionError("offline")
+    e.tick()
+    assert not e.is_primary
+    demote.assert_called_once()
+
+
+def test_bad_snapshot_never_promotes(client):
+    client.set("sdn:topology_state", "{bad")
+    e = LeaderElection(StateSync(client))
+    e.tick()
     assert not e.is_primary
 
 
-def test_promotion_when_heartbeat_lost():
-    """Backup should promote when primary heartbeat is gone."""
-    promoted = []
-
-    def on_promote(graph, log, elapsed_ms):
-        promoted.append(elapsed_ms)
-
-    e = make_election(primary_alive=False, on_promote=on_promote)
-    e.detect_ts = time.time()   # simulate detection
-    e._promote()
-
-    assert e.state == LeaderElection.PRIMARY
-    assert e.is_primary
-    assert len(promoted) == 1
-
-
-def test_failover_time_is_measured():
-    e = make_election(primary_alive=False)
-    t0 = time.time()
-    e.detect_ts = t0
-    e._promote()
-    ft = e.failover_time_ms()
-    assert ft is not None
-    assert ft >= 0
-    assert ft < 5000   # should complete in < 5s in tests
-
-
-def test_no_failover_time_before_promotion():
-    e = make_election(primary_alive=True)
-    assert e.failover_time_ms() is None
-
-
-def test_state_loaded_from_sync_on_promotion():
-    """Graph should be restored from synced state on promotion."""
-    loaded_graphs = []
-
-    def on_promote(graph, log, elapsed_ms):
-        loaded_graphs.append(graph)
-
-    e = make_election(primary_alive=False, on_promote=on_promote)
-    e.detect_ts = time.time()
-    e._promote()
-
-    assert len(loaded_graphs) == 1
-    # Graph restored (even if empty in mock)
-    assert loaded_graphs[0] is not None
-
-
-def test_backup_writes_heartbeat_after_promotion():
-    e = make_election(primary_alive=False)
-    e.detect_ts = time.time()
-    e._promote()
-    assert "test-backup" in e.sync.heartbeats
-
-
-def test_double_promotion_does_not_regress():
-    """Calling _promote twice should not break state."""
-    e = make_election(primary_alive=False)
-    e.detect_ts = time.time()
-    e._promote()
-    assert e.state == LeaderElection.PRIMARY
-    e._promote()   # second call — should stay PRIMARY
-    assert e.state == LeaderElection.PRIMARY
+def test_expired_local_lease_stops_writes_without_tick(client):
+    e = LeaderElection(StateSync(client))
+    e.tick()
+    e.lease_deadline = 0
+    assert not e.is_primary

@@ -1,61 +1,32 @@
 # Contributing
 
-Thank you for considering a contribution to this project!
+Use Ubuntu 22.04 and Python 3.10 for the supported controller runtime.
+Run `bash setup_wsl.sh` to create an isolated environment without deleting an
+existing environment or modifying system Python.
 
-## Development Environment
-
-```bash
-# Clone and set up
-git clone https://github.com/kishansaaai/sdn-link-failure
-cd sdn-link-failure
-
-# Install Python dependencies
-pip install -r requirements.txt
-
-# Run tests
-pytest tests/ --cov=ryu_controller --cov=ha -v
-```
-
-## Running the Controller Locally (requires Ubuntu + Mininet)
+Before submitting changes:
 
 ```bash
-# Full stack via Docker (recommended)
-docker compose up
-
-# OR bare metal
-ryu-manager --observe-links ryu_controller/sdn_controller.py &
-sudo python3 topologies/mesh_topo.py
+.venv/bin/ruff check .
+.venv/bin/mypy ryu_controller/topology_graph.py ha --ignore-missing-imports
+.venv/bin/python -m pytest --cov=ryu_controller --cov=ha
+sudo python3 tests/integration_lab.py --controller-python "$PWD/.venv/bin/python"
+docker compose up --build -d --wait
+docker compose down
 ```
 
-## Code Style
+Unit coverage excludes live-switch event paths; review the integration results
+alongside it. Add regression tests for changed routing, role, protocol and
+measurement behavior. Keep the distinction between message timing and actual
+packet delivery in documentation and benchmark output.
 
-This project uses [ruff](https://docs.astral.sh/ruff/) for linting:
-```bash
-ruff check ryu_controller/ ha/
-```
+New topologies belong in topologies/ and must use unique OpenFlow datapath IDs
+and mutually reachable host IPs. Register their factory in topologies/runner.py.
+The integration harness identifies switches by object/DPID, not by name prefixes.
 
-And [mypy](https://mypy.readthedocs.io/) for type checking:
-```bash
-mypy ryu_controller/topology_graph.py ha/backup.py --ignore-missing-imports
-```
+The legacy/ directory preserves the original POX experiment. New controller
+work belongs in ryu_controller/ and ha/.
 
-## Adding a New Topology
-
-1. Create `topologies/your_topo.py` with a `Topo` subclass named `YourTopo`.
-2. Import it in `chaos_test.py`'s `build_topo()` factory function.
-3. Add at least one test to `tests/test_topology_graph.py` verifying routing works on it.
-
-## Pull Request Checklist
-
-- [ ] All tests pass (`pytest tests/`)
-- [ ] Coverage stays ≥ 80% on `ryu_controller/` and `ha/`
-- [ ] Ruff passes with no errors
-- [ ] mypy passes on modified files
-- [ ] New behaviour is documented in the relevant module docstring
-
-## Reporting Issues
-
-Please include:
-- OS and Python version
-- Whether you're using Docker or bare-metal
-- Relevant log output from the controller
+Report failures with OS/Python/OVS versions, topology, datapath type, relevant
+controller logs and benchmark JSON. Never include credentials or packet captures
+containing unrelated private traffic.

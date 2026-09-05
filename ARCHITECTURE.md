@@ -1,119 +1,87 @@
 # Architecture
 
-## System Overview
+## Packet and topology path
 
-This project implements a production-grade SDN controller with controller high availability, weighted routing, and full observability.
+The active controller sends its own LLDP probes through physical ports every
+second. Received probes identify both switches and their port numbers. A
+port-down event removes the link immediately; missing probes expire after four
+seconds. Standby controllers send no probes or flow changes.
 
-```mermaid
-graph TB
-    subgraph "Control Plane"
-        P["🟢 Ryu Primary\n(port 6633 / metrics :8000)"]
-        B["🟡 Ryu Backup\n(port 6634 / metrics :8001)"]
-        R[("Redis\nHeartbeat + State")]
-        P -- "heartbeat TTL + topology JSON" --> R
-        B -- "polls heartbeat\nevery 1s" --> R
-        B -- "promotes on TTL expiry" --> P
-    end
+A source MAC is learned on an access port before broadcast handling. Broadcast
+and unknown-unicast packets are copied directly from the controller to reachable
+access ports. They are never flooded through switch-to-switch links, avoiding
+broadcast cycles without STP. Known unicast traffic receives complete paths.
 
-    subgraph "Data Plane (Mininet)"
-        S1[s1] --- S2[s2]
-        S2 --- S3[s3]
-        S3 --- S4[s4]
-        S4 --- S5[s5]
-        S5 --- S1
-        S1 --- S3
-        H1[h1] --- S1
-        H2[h2] --- S1
-        H3[h3] --- S3
-        H4[h4] --- S4
-        H5[h5] --- S5
-        H6[h6] --- S5
-    end
+## Routing and flow lifecycle
 
-    subgraph "Observability"
-        PROM["Prometheus\n:9090"]
-        GRAF["Grafana\n:3000"]
-        PROM --> GRAF
-    end
+The routing cost combines latency, inverse available bandwidth, and packet loss.
+The graph validates finite, nonnegative metrics. Default link latency is 1 ms;
+port stats supply utilization/loss, not physical one-way latency. Traffic-engineering
+recomputation is triggered by a utilization change of at least 15 percentage points.
 
-    P -- "OF1.3 flow rules" --> S1
-    P -- "OF1.3 flow rules" --> S2
-    P -- "OF1.3 flow rules" --> S3
-    B -- "standby" --> S1
-    P -- "metrics /metrics" --> PROM
-    B -- "metrics /metrics" --> PROM
-```
+ECMP computes a destination-distance DAG without mutating the graph. Up to four
+near-equal paths are returned. Each branch switch uses a SELECT group referenced
+by its source/destination flow. Shared downstream branches cannot form cycles
+because every next hop strictly decreases distance to the destination.
 
-## Component Descriptions
+The controller keeps the entire path set for each source/destination intent.
+Failures replace only affected routes; unreachable destinations lose old
+rules and groups but retain their intent for restoration. Flow rules are
+permanent until reconciled, so controller intent and idle timeouts cannot drift.
+Updates are sent downstream first, then obsolete rules/groups are removed.
+This is not a cross-switch transaction: brief packet loss during an update
+is possible and must be measured in the data plane.
 
-### `ryu_controller/topology_graph.py`
-Pure-Python (no Ryu imports) graph engine. Provides:
-- `weighted_dijkstra(src, dst)` — composite cost = α·latency + β·(1/bw) + γ·loss
-- `ecmp_paths(src, dst)` — returns up to 4 equal-cost paths
-- `to_dict()` / `from_dict()` — serialisation for Redis state sync
+The application uses an SDN cookie prefix for flow deletion. On handshake or
+takeover it reconciles its flows and clears the dedicated lab switch's group
+table, then rebuilds intents. It therefore requires exclusive group-table ownership.
 
-### `ryu_controller/sdn_controller.py`
-Ryu `RyuApp` subclass using OpenFlow 1.3:
-- Table-miss entries, buffer_id handling, meter bands
-- LLDP echo round-trip latency probing (background thread)
-- `OFPPortStatsRequest` polling every 5 s for utilization-aware routing
-- `EventLinkAdd/Delete` from `ryu.topology` for live graph updates
-- OF1.3 Group Tables for ECMP traffic splitting
+## Controller HA
 
-### `ha/`
-- `state_sync.py` — Redis heartbeat TTL + JSON topology push/pull
-- `primary.py` — writes heartbeat every 2 s; pushes graph state
-- `backup.py` — `LeaderElection` state machine (WATCHING → PROMOTING → PRIMARY)
+Both configured HA processes use the same election state machine. The first
+successful Redis lease acquisition becomes active; the primary/backup names
+are startup preferences established by Compose ordering, not permanent identities.
 
-### `ryu_controller/metrics_exporter.py`
-Prometheus metrics exposed on `:8000`:
-- `sdn_link_up{src, dst}` — gauge per link
-- `sdn_flow_install_total` — counter
-- `sdn_recovery_time_ms` — histogram (5 ms to 2.5 s buckets)
-- `sdn_active_flows` — gauge
-- `sdn_controller_role` — 1=primary, 0=backup
+Acquisition, renewal, publication and release use atomic Lua scripts checking
+the lease owner. A lease lasts five seconds and renews every second. Successful
+acquisition increments a persistent generation counter, used in OpenFlow MASTER
+requests. Standbys query each switch's generation before requesting SLAVE and
+retry if another controller promotes during that exchange.
 
-### `chaos_test.py`
-Automated chaos harness:
-- Starts Mininet with chosen topology
-- Randomly kills 1–3 links at random intervals
-- Polls `/recovery-log` REST API after each failure
-- Outputs p50/p95/p99 recovery times and matplotlib chart
+A controller stops issuing application writes when it loses Redis access,
+ownership, or its conservative local lease deadline. The backup must acquire
+the lease before loading the last topology/intent snapshot and requesting MASTER.
+Only MASTER role replies enable programming on each switch. An old primary
+rejoining remains standby while the current lease is valid.
 
-### `pcap_analysis.py`
-tshark-based packet-level proof:
-- Captures OF control channel during test
-- Asserts `OFPT_PORT_STATUS(down)` → `OFPT_FLOW_MOD` within recovery window
+Snapshots include graph, hosts, intents and the bounded recovery log. They may
+be one interval stale; LLDP and port events reconcile them. Redis AOF data keeps
+the generation counter across normal restarts. Do not erase Redis state while
+switches retain controller generations; that requires a coordinated lab reset.
+Queued OpenFlow messages and a Redis/switch network partition cannot provide
+the guarantees of a consensus-based production controller cluster.
 
-## Data Flow: Link Failure Sequence
+## Interfaces and observability
 
-```
-1. Mininet: link s1-s2 goes DOWN
-2. OVS kernel: sends OFPT_PORT_STATUS to primary controller
-3. sdn_controller: EventLinkDelete handler fires
-4. topology_graph.remove_link(s1, s2)
-5. Find affected active_paths that traverse s1↔s2
-6. For each path: delete stale flows (OFPFC_DELETE to each switch)
-7. ecmp_paths(src_dpid, dst_dpid) → new shortest path via Dijkstra
-8. _install_path → OFPFC_ADD on each switch in new path
-9. recovery_log.append({recovery_ms: ...})  ← measured here
-10. Prometheus: recovery_time_ms.observe(elapsed_ms)
-```
+The Ryu WSGI listener serves /health, /topology, /paths, /recovery-log and
+/metrics. /health is process health and includes role, connected/ready switch
+counts, generation and the most recent HA error; an empty topology can still
+be a healthy process. A standby's topology may be empty until takeover.
 
-## File Structure
+Prometheus metrics include link state/utilization, installed FlowMods, desired
+path-rule count, controller role, unexpected OpenFlow errors and controller
+enqueue-time distributions. Metric registries are isolated per app instance.
+Grafana reads the two API listeners through Docker service DNS.
 
-```
-sdn-link-failure/
-├── legacy/                  # POX v1 prototype (preserved for growth story)
-├── ryu_controller/          # Ryu OF1.3 controller + graph engine
-├── ha/                      # Primary/backup + Redis leader election
-├── topologies/              # Ring, mesh, fat-tree Mininet topologies
-├── tests/                   # pytest: topology graph, HA, weight function
-├── benchmarks/              # Chaos test output: results.md + chart.png
-├── docker/                  # Dockerfile + Grafana provisioning
-├── chaos_test.py            # Chaos engineering harness
-├── pcap_analysis.py         # OpenFlow pcap assertion tool
-├── docker-compose.yml       # Full stack in one command
-├── prometheus.yml           # Scrape config
-└── .github/workflows/       # Tests + lint + Docker build CI
-```
+## Validation
+
+The unit suite verifies graph invariants, routing and packet handling with real
+Ryu wire encoders, API serialization, counter reset behavior, lease fencing and
+measurement parsing. The integration suite uses Mininet and actual Open vSwitch
+processes for ring, mesh and canonical k=4 fat-tree topologies.
+
+The chaos runner measures continuous ping replies and verifies connectivity
+while the link is still down. The packet-capture utility checks actual port-down
+events followed by add/modify commands on the same OpenFlow connection. It
+rejects captures without evidence and does not mistake deletes for installs.
+Neither tool equates controller messages with guaranteed data-plane recovery.

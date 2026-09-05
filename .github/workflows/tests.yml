@@ -1,38 +1,31 @@
-name: Tests & Coverage
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
-
+name: Tests
+on: [push, pull_request]
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  unit:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest pytest-cov numpy flask prometheus_client
-
-      - name: Run tests with coverage
-        run: |
-          pytest tests/ \
-            --cov=ryu_controller \
-            --cov=ha \
-            --cov-report=term-missing \
-            --cov-report=xml \
-            -v
-
-      - name: Upload coverage report
-        uses: codecov/codecov-action@v4
+          python-version: "3.10"
+      - run: python -m pip install pip==24.0 setuptools==57.5.0 wheel==0.42.0
+      - run: pip install --no-build-isolation -r requirements.txt -r requirements-dev.txt
+      - run: pytest --cov=ryu_controller --cov=ha --cov-report=term-missing --cov-report=xml
+      - uses: actions/upload-artifact@v4
         with:
-          files: coverage.xml
-          fail_ci_if_error: false
+          name: coverage
+          path: coverage.xml
+  integration:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mininet openvswitch-switch redis-server python3.10-venv
+      - run: bash setup_wsl.sh
+      - run: sudo systemctl start openvswitch-switch
+      - run: sudo python3 tests/integration_lab.py --controller-python "$PWD/.venv/bin/python"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-network-results
+          path: benchmarks/live/

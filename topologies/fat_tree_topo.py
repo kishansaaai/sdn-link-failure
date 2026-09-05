@@ -1,46 +1,34 @@
-"""
-fat_tree_topo.py — k=4 Fat-tree topology.
-
-k=4: 4 core, 4 aggregation, 4 edge switches, 8 hosts.
-Industry-standard data centre topology for SDN research.
-"""
+"""Canonical k-ary fat-tree: k=4 has 20 switches and 16 hosts."""
 from mininet.topo import Topo
 
+
 class FatTreeTopo(Topo):
-    def build(self, k: int = 4):
-        num_pods     = k
-        num_core     = (k // 2) ** 2
-        num_agg      = k * k // 2
-        num_edge     = k * k // 2
-        hosts_per_edge = k // 2
+    def build(self, k=4):
+        if not isinstance(k, int) or k < 2 or k % 2:
+            raise ValueError("k must be an even integer >= 2")
+        next_id = 1
 
-        core    = [self.addSwitch(f'c{i+1}')  for i in range(num_core)]
-        agg     = [self.addSwitch(f'a{i+1}')  for i in range(num_agg)]
-        edge    = [self.addSwitch(f'e{i+1}')  for i in range(num_edge)]
+        def switch(name):
+            nonlocal next_id
+            result = self.addSwitch(name, dpid=f"{next_id:016x}", protocols="OpenFlow13")
+            next_id += 1
+            return result
 
+        core = [switch(f"c{i + 1}") for i in range((k // 2) ** 2)]
+        agg = [switch(f"a{i + 1}") for i in range(k * k // 2)]
+        edge = [switch(f"e{i + 1}") for i in range(k * k // 2)]
         host_id = 1
-        for pod in range(num_pods):
-            agg_in_pod  = agg[pod * k // 2 : (pod + 1) * k // 2]
-            edge_in_pod = edge[pod * k // 2 : (pod + 1) * k // 2]
-
-            # Edge → Agg
-            for e in edge_in_pod:
-                for a in agg_in_pod:
-                    self.addLink(e, a, bw=100)
-
-            # Hosts → Edge
-            for e in edge_in_pod:
-                for _ in range(hosts_per_edge):
-                    h = self.addHost(f'h{host_id}',
-                                     ip=f'10.{pod}.{host_id}.1/24')
-                    self.addLink(h, e, bw=10)
-                    host_id += 1
-
-        # Agg → Core
         stride = k // 2
-        for i, a in enumerate(agg):
-            pod_idx   = i // stride
-            local_idx = i % stride
-            for j in range(stride):
-                c_idx = local_idx * stride + j
-                self.addLink(a, core[c_idx], bw=1000)
+        for pod in range(k):
+            pod_agg = agg[pod * stride:(pod + 1) * stride]
+            pod_edge = edge[pod * stride:(pod + 1) * stride]
+            for edge_switch in pod_edge:
+                for agg_switch in pod_agg:
+                    self.addLink(edge_switch, agg_switch, bw=100)
+                for _ in range(stride):
+                    host = self.addHost(f"h{host_id}", ip=f"10.0.0.{host_id}/24")
+                    self.addLink(host, edge_switch, bw=10)
+                    host_id += 1
+            for local, agg_switch in enumerate(pod_agg):
+                for j in range(stride):
+                    self.addLink(agg_switch, core[local * stride + j], bw=100)

@@ -1,5 +1,5 @@
-from mininet.node import OVSSwitch
-import inspect
-
-print(inspect.getsource(OVSSwitch.__init__))
-print(inspect.getsource(OVSSwitch.start))
+"""Print installed Mininet switch implementation when run explicitly."""
+if __name__ == "__main__":
+    import inspect
+    from mininet.node import OVSSwitch
+    print(inspect.getsource(OVSSwitch.start))

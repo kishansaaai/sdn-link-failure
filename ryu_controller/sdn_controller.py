@@ -1,15 +1,7 @@
-"""
-sdn_controller.py — Ryu OpenFlow 1.3 SDN controller.
+"""OpenFlow 1.3 controller: loop-free discovery, weighted ECMP and fenced HA.
 
-Features:
-  - LLDP-based topology discovery via ryu.topology API
-  - Weighted Dijkstra + ECMP path selection
-  - Proactive flow installation end-to-end (no per-hop learning)
-  - Fast failover: only affected flows are deleted and reinstalled
-  - Periodic port-stats polling for utilization-aware routing
-  - LLDP echo probing for live latency measurement
-  - Meter bands for rate limiting on rerouted ports
-  - Prometheus metrics export (see metrics_exporter.py)
+Use start_ryu.py. This app owns LLDP discovery; do not load ryu.topology
+(--observe-links), whose independent writer is incompatible with slave roles.
 """
 from __future__ import annotations
 
@@ -18,519 +10,496 @@ import logging
 import os
 import struct
 import time
-from typing import Dict, List, Optional, Tuple
+from collections import deque
 
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from ryu.app.wsgi import ControllerBase, WSGIApplication, route
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, DEAD_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.lib import hub
-from ryu.lib.packet import ether_types, ethernet, lldp, packet
+from ryu.lib.packet import ethernet, lldp, packet
 from ryu.ofproto import ofproto_v1_3
-from ryu.topology import event as topo_event
-from ryu.topology.api import get_all_link, get_all_switch
+from webob import Response
 
+from ha.backup import LeaderElection
 from ryu_controller.group_allocator import GroupIdAllocator
 from ryu_controller.metrics_exporter import SDNMetrics
 from ryu_controller.topology_graph import LinkMetrics, TopologyGraph
 
 log = logging.getLogger(__name__)
+COOKIE = 0x53444E0000000000
+COOKIE_MASK = 0xFFFFFF0000000000
+FLOW_PRIORITY_PATH = 20
+DISCOVERY_INTERVAL = 1
+LINK_TIMEOUT = 4
+STATS_INTERVAL = 5
 
-# ---------------------------------------------------------------------------
-# Tunable constants
-# ---------------------------------------------------------------------------
-PORT_STATS_INTERVAL   = 5      # seconds between OFPPortStatsRequest polls
-LATENCY_PROBE_INTERVAL = 3     # seconds between LLDP echo probes
-UTIL_THRESHOLD        = 0.75   # rebalance if any link utilization > 75 %
-FLOW_PRIORITY_PATH    = 20
-FLOW_PRIORITY_MISS    = 0
-FLOW_IDLE_TIMEOUT     = 30     # seconds; 0 = permanent
-METER_ID_REROUTE      = 1      # meter applied on rerouted ports
-LLDP_ETHER_TYPE       = 0x88CC
-CONTROLLER_PORT       = int(os.getenv("OF_PORT", "6633"))
-
-
-from ryu.lib import hub
-from ryu.app.wsgi import ControllerBase, WSGIApplication, route
-from webob import Response
-import json
 
 class SDNApi(ControllerBase):
     def __init__(self, req, link, data, **config):
-        super(SDNApi, self).__init__(req, link, data, **config)
-        self.sdn_app = data['sdn_app']
+        super().__init__(req, link, data, **config)
+        self.sdn = data["sdn_app"]
 
-    @route('sdn', '/recovery-log', methods=['GET'])
-    def get_recovery_log(self, req, **kwargs):
-        return Response(content_type='application/json', text=json.dumps(self.sdn_app.recovery_log))
+    @route("sdn", "/{endpoint}", methods=["GET"],
+           requirements={"endpoint": "health|topology|paths|recovery-log|metrics"})
+    def get(self, req, endpoint, **kwargs):
+        if endpoint == "metrics":
+            return Response(body=generate_latest(self.sdn.metrics.registry),
+                            content_type=CONTENT_TYPE_LATEST)
+        data = {
+            "health": self.sdn.health,
+            "topology": self.sdn.graph.to_dict,
+            "paths": self.sdn.paths_json,
+            "recovery-log": lambda: list(self.sdn.recovery_log),
+        }[endpoint]()
+        return Response(content_type="application/json", text=json.dumps(data))
+
 
 class SDNController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
-    _CONTEXTS = {'wsgi': WSGIApplication}
+    _CONTEXTS = {"wsgi": WSGIApplication}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.graph      = TopologyGraph()
+        self.graph = TopologyGraph()
+        self.dpid_conns = {}
+        self.ports = {}
+        self.ready = set()
+        self.intents = set()
+        self.active_paths = {}
+        self.groups = {}
         self.group_alloc = GroupIdAllocator()
-        self.dpid_conns: Dict[int, object]  = {}   # dpid -> datapath
-        self.active_paths: Dict[Tuple, List[int]] = {}  # (src_mac, dst_mac) -> [dpid...]
-        self.recovery_log: List[dict]        = []
-        self.port_prev_stats: Dict[Tuple[int,int], dict] = {}  # (dpid,port)->stats
-        self._lldp_timestamps: Dict[Tuple[int,int], float] = {}  # (dpid,port)->send_ts
+        self.port_prev_stats = {}
+        self.link_seen = {}
+        self.trunk_ports = set()
+        self.recovery_log = deque(maxlen=1000)
         self.metrics = SDNMetrics()
-        
-        wsgi = kwargs['wsgi']
-        wsgi.register(SDNApi, {'sdn_app': self})
-        # Background polling threads
-        self._stats_thread   = hub.spawn(self._port_stats_loop)
-        self._latency_thread = hub.spawn(self._latency_probe_loop)
-        log.info("SDNController started (Ryu OF1.3)")
+        self.started = time.monotonic()
+        self.capacity = float(os.getenv("LINK_CAPACITY_MBPS", "100"))
+        if self.capacity <= 0:
+            raise ValueError("LINK_CAPACITY_MBPS must be positive")
+        role = os.getenv("CONTROLLER_ROLE", "standalone")
+        if role not in ("standalone", "primary", "backup"):
+            raise ValueError("CONTROLLER_ROLE must be standalone, primary or backup")
+        self.election = None if role == "standalone" else LeaderElection(
+            on_promote=self._promote, on_demote=self._demote)
+        self.metrics.controller_role.set(self.is_primary)
+        kwargs["wsgi"].register(SDNApi, {"sdn_app": self})
+        self._worker = hub.spawn(self._maintenance)
 
-    # -----------------------------------------------------------------------
-    # Switch handshake — install table-miss + meter
-    # -----------------------------------------------------------------------
+    @property
+    def is_primary(self):
+        return self.election is None or self.election.is_primary
+
+    def health(self):
+        return {
+            "status": "ok",
+            "role": "primary" if self.is_primary else "backup",
+            "mode": "standalone" if self.election is None else "ha",
+            "switches": len(self.dpid_conns),
+            "ready_switches": len(self.ready),
+            "generation": self.election.generation if self.election else 0,
+            "ha_error": self.election.last_error if self.election else None,
+        }
+
+    def paths_json(self):
+        return [{"src_mac": s, "dst_mac": d, "paths": self.active_paths.get((s, d), []),
+                 "status": "active" if (s, d) in self.active_paths else "unreachable"}
+                for s, d in sorted(self.intents)]
+
+    def _snapshot(self):
+        return {"graph": self.graph.to_dict(), "intents": sorted(self.intents),
+                "recovery_log": list(self.recovery_log)}
+
+    def _promote(self, state):
+        if state:
+            self.graph = TopologyGraph.from_dict(state.get("graph", {}))
+            self.intents = {tuple(key) for key in state.get("intents", [])}
+            self.recovery_log = deque(state.get("recovery_log", []), maxlen=1000)
+        now = time.monotonic()
+        self.link_seen = {(a, b): now for a in self.graph.adj for b in self.graph.adj[a]}
+        self.trunk_ports = {(a, p) for a in self.graph.adj for p, _ in self.graph.adj[a].values()}
+        self.active_paths.clear()
+        self.groups.clear()
+        self.ready.clear()
+        for dp in list(self.dpid_conns.values()):
+            self._request_role(dp)
+
+    def _demote(self):
+        self.ready.clear()
+        for dp in list(self.dpid_conns.values()):
+            self._request_role(dp)
+
+    def _request_role(self, dp):
+        role = dp.ofproto.OFPCR_ROLE_MASTER if self.is_primary else dp.ofproto.OFPCR_ROLE_NOCHANGE
+        generation = self.election.generation if self.election else 0
+        # Read the switch's generation before requesting SLAVE. A restarted
+        # standby does not yet know the current epoch; guessing causes STALE.
+        dp.send_msg(dp.ofproto_parser.OFPRoleRequest(dp, role, generation))
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        dp   = ev.msg.datapath
-        ofp  = dp.ofproto
-        par  = dp.ofproto_parser
+        dp = ev.msg.datapath
         self.dpid_conns[dp.id] = dp
         self.graph.add_switch(dp.id)
-        log.info("Switch connected: %016x", dp.id)
+        self.ports[dp.id] = {}
+        dp.send_msg(dp.ofproto_parser.OFPPortDescStatsRequest(dp, 0))
+        self._request_role(dp)
 
-        # 1. Install meter for reroute rate limiting (1 Gbps burst)
-        bands = [par.OFPMeterBandDrop(rate=100_000, burst_size=1_000)]
-        dp.send_msg(par.OFPMeterMod(
-            datapath=dp,
-            command=ofp.OFPMC_ADD,
-            flags=ofp.OFPMF_KBPS,
-            meter_id=METER_ID_REROUTE,
-            bands=bands,
-        ))
-
-        # 2. Table-miss: send to controller, lowest priority
-        match  = par.OFPMatch()
+    @set_ev_cls(ofp_event.EventOFPRoleReply, [CONFIG_DISPATCHER, MAIN_DISPATCHER])
+    def role_reply_handler(self, ev):
+        dp = ev.msg.datapath
+        if not self.is_primary and ev.msg.role != dp.ofproto.OFPCR_ROLE_SLAVE:
+            dp.send_msg(dp.ofproto_parser.OFPRoleRequest(
+                dp, dp.ofproto.OFPCR_ROLE_SLAVE, ev.msg.generation_id))
+        if ev.msg.role != dp.ofproto.OFPCR_ROLE_MASTER or not self.is_primary:
+            self.ready.discard(dp.id)
+            return
+        self.ready.add(dp.id)
+        ofp, par = dp.ofproto, dp.ofproto_parser
+        # Dedicated lab switches: reconcile this app's flows and group table
+        # on reconnect/promotion so unsynced old group IDs cannot survive.
+        dp.send_msg(par.OFPFlowMod(dp, cookie=COOKIE, cookie_mask=COOKIE_MASK,
+            command=ofp.OFPFC_DELETE, table_id=ofp.OFPTT_ALL,
+            out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY))
+        dp.send_msg(par.OFPGroupMod(dp, ofp.OFPGC_DELETE, ofp.OFPGT_ALL, ofp.OFPG_ALL))
+        self.groups = {key: gid for key, gid in self.groups.items() if key[0] != dp.id}
         actions = [par.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
-        inst    = [par.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        mod     = par.OFPFlowMod(
-            datapath=dp, priority=FLOW_PRIORITY_MISS,
-            match=match, instructions=inst,
-        )
-        dp.send_msg(mod)
-        self.metrics.active_flows.inc()
+        dp.send_msg(par.OFPFlowMod(dp, cookie=COOKIE, priority=0, match=par.OFPMatch(),
+            instructions=[par.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]))
+        self._recompute(reason="controller")
+        self._send_discovery()
 
-    # -----------------------------------------------------------------------
-    # Topology events (from ryu.topology)
-    # -----------------------------------------------------------------------
-
-    @set_ev_cls(topo_event.EventLinkAdd)
-    def link_add_handler(self, ev):
-        link = ev.link
-        dpid1, port1 = link.src.dpid, link.src.port_no
-        dpid2, port2 = link.dst.dpid, link.dst.port_no
-        self.graph.add_link(dpid1, port1, dpid2, port2)
-        self.metrics.link_up.labels(
-            src=str(dpid1), dst=str(dpid2)).set(1)
-        log.info("Link UP %016x:%d <-> %016x:%d", dpid1, port1, dpid2, port2)
-
-    @set_ev_cls(topo_event.EventLinkDelete)
-    def link_delete_handler(self, ev):
-        link = ev.link
-        dpid1, dpid2 = link.src.dpid, link.dst.dpid
-        t0 = time.time()
-        self.graph.remove_link(dpid1, dpid2)
-        self.metrics.link_up.labels(
-            src=str(dpid1), dst=str(dpid2)).set(0)
-        log.warning("LINK FAILURE: %016x <-> %016x", dpid1, dpid2)
-
-        # Reroute ALL active flows when any link fails to ensure ECMP failover is fully tracked
-        affected = list(self.active_paths.keys())
-        for key in affected:
-            self._reroute(key, t0)
-
-    @set_ev_cls(topo_event.EventSwitchLeave)
-    def switch_leave_handler(self, ev):
-        dpid = ev.switch.dp.id
+    @set_ev_cls(ofp_event.EventOFPStateChange, DEAD_DISPATCHER)
+    def disconnect_handler(self, ev):
+        dpid = ev.datapath.id
+        if self.dpid_conns.get(dpid) is not ev.datapath:
+            return
         self.dpid_conns.pop(dpid, None)
-        log.warning("Switch disconnected: %016x", dpid)
+        self.ready.discard(dpid)
+        self.ports.pop(dpid, None)
+        self.graph.remove_switch(dpid)
+        self._recompute(reason="switch_failure")
 
-    # -----------------------------------------------------------------------
-    # PacketIn — host learning + path install
-    # -----------------------------------------------------------------------
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_handler(self, ev):
+        dp = ev.msg.datapath
+        for desc in ev.msg.body:
+            if desc.port_no < dp.ofproto.OFPP_MAX:
+                self.ports.setdefault(dp.id, {})[desc.port_no] = desc
+        if self.is_primary:
+            self._send_discovery()
+
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        dp, desc = ev.msg.datapath, ev.msg.desc
+        if desc.port_no >= dp.ofproto.OFPP_MAX:
+            return
+        down = ev.msg.reason == dp.ofproto.OFPPR_DELETE or not self._port_up(dp, desc)
+        if ev.msg.reason == dp.ofproto.OFPPR_DELETE:
+            self.ports.get(dp.id, {}).pop(desc.port_no, None)
+        else:
+            self.ports.setdefault(dp.id, {})[desc.port_no] = desc
+        if down:
+            affected = set()
+            for neighbor, (port, _) in list(self.graph.adj.get(dp.id, {}).items()):
+                if port == desc.port_no:
+                    affected |= self._affected(dp.id, neighbor)
+                    self._remove_link(dp.id, neighbor)
+            for mac, loc in list(self.graph.hosts.items()):
+                if (loc.dpid, loc.port) == (dp.id, desc.port_no):
+                    del self.graph.hosts[mac]
+                    affected |= {key for key in self.intents if mac in key}
+            self._recompute(affected, "failure")
+        elif self.is_primary:
+            self._send_discovery()
+
+    @staticmethod
+    def _port_up(dp, desc):
+        return not (desc.state & dp.ofproto.OFPPS_LINK_DOWN or
+                    desc.config & dp.ofproto.OFPPC_PORT_DOWN)
+
+    def _send_discovery(self):
+        if not self.is_primary:
+            return
+        for dpid in list(self.ready):
+            dp = self.dpid_conns[dpid]
+            for port, desc in list(self.ports.get(dpid, {}).items()):
+                if not self._port_up(dp, desc):
+                    continue
+                pkt = packet.Packet()
+                pkt.add_protocol(ethernet.ethernet(dst=lldp.LLDP_MAC_NEAREST_BRIDGE,
+                                 src=desc.hw_addr, ethertype=0x88cc))
+                pkt.add_protocol(lldp.lldp(tlvs=[
+                    lldp.ChassisID(subtype=lldp.ChassisID.SUB_LOCALLY_ASSIGNED,
+                                   chassis_id=("sdn:%d" % dpid).encode()),
+                    lldp.PortID(subtype=lldp.PortID.SUB_PORT_COMPONENT,
+                                port_id=struct.pack("!I", port)),
+                    lldp.TTL(ttl=LINK_TIMEOUT), lldp.End()]))
+                pkt.serialize()
+                self._packet_out(dp, pkt.data, dp.ofproto.OFPP_CONTROLLER, [port])
+
+    def _learn_link(self, dp, in_port, pkt):
+        probe = pkt.get_protocol(lldp.lldp)
+        if not probe or len(probe.tlvs) < 3:
+            return
+        try:
+            chassis = probe.tlvs[0].chassis_id.decode()
+            if not chassis.startswith("sdn:"):
+                return
+            src = int(chassis[4:])
+            src_port = struct.unpack("!I", probe.tlvs[1].port_id)[0]
+        except (AttributeError, ValueError, UnicodeError, struct.error):
+            return
+        if src == dp.id or src not in self.ready:
+            return
+        changed = dp.id not in self.graph.adj.get(src, {})
+        if changed:
+            self.graph.add_link(src, src_port, dp.id, in_port,
+                                LinkMetrics(bandwidth_mbps=self.capacity))
+        self.link_seen[(src, dp.id)] = time.monotonic()
+        self.trunk_ports.update(((src, src_port), (dp.id, in_port)))
+        for mac, loc in list(self.graph.hosts.items()):
+            if (loc.dpid, loc.port) in self.trunk_ports:
+                del self.graph.hosts[mac]
+        for a, b in ((src, dp.id), (dp.id, src)):
+            self.metrics.link_up.labels(str(a), str(b)).set(1)
+        if changed:
+            self._recompute(reason="restoration")
+
+    def _remove_link(self, a, b):
+        self.graph.remove_link(a, b)
+        self.link_seen.pop((a, b), None)
+        self.link_seen.pop((b, a), None)
+        for src, dst in ((a, b), (b, a)):
+            self.metrics.link_up.labels(str(src), str(dst)).set(0)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        msg  = ev.msg
-        dp   = msg.datapath
-        ofp  = dp.ofproto
-        par  = dp.ofproto_parser
+        msg, dp = ev.msg, ev.msg.datapath
+        if not self.is_primary or dp.id not in self.ready:
+            return
         in_port = msg.match["in_port"]
-
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         if eth is None:
             return
-
-        # Intercept our own latency probes
-        if eth.ethertype == LLDP_ETHER_TYPE:
-            self._handle_lldp_probe(dp.id, in_port, pkt)
+        if eth.ethertype == 0x88cc:
+            self._learn_link(dp, in_port, pkt)
             return
-
-        src_mac = eth.src
-        dst_mac = eth.dst
-
-        # Skip multicast / broadcast for path learning
-        if dst_mac == "ff:ff:ff:ff:ff:ff":
-            self._flood(dp, msg, in_port)
+        if int(eth.src.split(":")[0], 16) & 1:
             return
+        if (dp.id, in_port) not in self.trunk_ports:
+            previous = self.graph.hosts.get(eth.src)
+            self.graph.learn_host(eth.src, dp.id, in_port)
+            if previous and (previous.dpid, previous.port) != (dp.id, in_port):
+                self._recompute({key for key in self.intents if eth.src in key}, "host_move")
+        if int(eth.dst.split(":")[0], 16) & 1:
+            self._flood_access(dp, msg.data, in_port)
+            return
+        src, dst = self.graph.hosts.get(eth.src), self.graph.hosts.get(eth.dst)
+        if not src or not dst:
+            self._flood_access(dp, msg.data, in_port)
+            return
+        key = (eth.src, eth.dst)
+        self.intents.add(key)
+        self._recompute({key}, "packet")
+        paths = self.active_paths.get(key, [])
+        for path in paths:
+            if dp.id in path:
+                index = path.index(dp.id)
+                out_port = dst.port if index == len(path) - 1 else self.graph.adj[dp.id][path[index + 1]][0]
+                self._packet_out(dp, msg.data, in_port, [out_port])
+                break
 
-        # Learn host
-        if not self._is_switch_port(dp.id, in_port):
-            self.graph.learn_host(src_mac, dp.id, in_port)
+    def _flood_access(self, ingress, data, in_port):
+        # Replicate once at each reachable access switch. Never emit to trunks;
+        # cyclic topologies need neither flooding rules nor STP convergence.
+        if (ingress.id, in_port) in self.trunk_ports:
+            return
+        for dpid in list(self.ready):
+            if self.graph.weighted_dijkstra(ingress.id, dpid) is None:
+                continue
+            dp = self.dpid_conns[dpid]
+            ports = [p for p, desc in self.ports.get(dpid, {}).items()
+                     if (dpid, p) not in self.trunk_ports and self._port_up(dp, desc)
+                     and (dpid, p) != (ingress.id, in_port)]
+            if ports:
+                self._packet_out(dp, data, dp.ofproto.OFPP_CONTROLLER, ports)
 
-        # Try to route
-        dst_loc = self.graph.hosts.get(dst_mac)
-        src_loc = self.graph.hosts.get(src_mac)
-        if dst_loc and src_loc:
-            paths = self.graph.ecmp_paths(src_loc.dpid, dst_loc.dpid)
+    def _packet_out(self, dp, data, in_port, ports):
+        if not self.is_primary or dp.id not in self.ready:
+            return
+        par = dp.ofproto_parser
+        dp.send_msg(par.OFPPacketOut(dp, buffer_id=dp.ofproto.OFP_NO_BUFFER,
+            in_port=in_port, actions=[par.OFPActionOutput(p) for p in ports], data=data))
+
+    @staticmethod
+    def _path_uses_link(path, a, b):
+        return any({u, v} == {a, b} for u, v in zip(path, path[1:]))
+
+    def _affected(self, a, b):
+        return {key for key, paths in self.active_paths.items()
+                if any(self._path_uses_link(path, a, b) for path in paths)}
+
+    def _recompute(self, keys=None, reason="failure"):
+        if not self.is_primary:
+            return
+        for key in list(self.intents if keys is None else keys):
+            started = time.monotonic()
+            src, dst = (self.graph.hosts.get(mac) for mac in key)
+            paths = self.graph.ecmp_paths(src.dpid, dst.dpid) if src and dst else []
+            paths = [path for path in paths if all(dpid in self.ready for dpid in path)]
+            old = self.active_paths.get(key, [])
+            if paths == old and reason not in ("packet", "controller", "host_move"):
+                continue
+            self._replace_routes(key, paths, dst.port if dst else None)
             if paths:
-                key = (src_mac, dst_mac)
-                if len(paths) > 1:
-                    self._install_ecmp(paths, key, src_mac, dst_mac, dst_loc.port)
-                else:
-                    self._install_path(paths[0], key, src_mac, dst_mac, dst_loc.port)
-                self.active_paths[key] = paths[0]
-                # Forward this buffered packet
-                self._send_packet_out(dp, msg, in_port,
-                                      self._first_hop_port(dp.id, paths[0]))
-                return
+                self.active_paths[key] = paths
+            else:
+                self.active_paths.pop(key, None)
+            if reason != "packet" and (old or paths):
+                elapsed = (time.monotonic() - started) * 1000
+                self.recovery_log.append({
+                    "src_mac": key[0], "dst_mac": key[1], "reason": reason,
+                    "status": "rerouted" if paths else "unreachable",
+                    "recovery_ms": elapsed, "measurement": "controller_enqueue",
+                    "new_path": paths[0] if paths else [], "paths": paths, "ts": time.time(),
+                })
+                if paths:
+                    self.metrics.recovery_time_ms.observe(elapsed)
+        self.metrics.active_flows.set(sum(len({n for path in paths for n in path})
+                                         for paths in self.active_paths.values()))
 
-        self._flood(dp, msg, in_port)
-
-    # -----------------------------------------------------------------------
-    # Port stats reply — utilization + rebalancing
-    # -----------------------------------------------------------------------
+    def _replace_routes(self, key, paths, dst_port):
+        outputs = {}
+        rank = {}
+        for path in paths:
+            for index, dpid in enumerate(path):
+                port = dst_port if index == len(path) - 1 else self.graph.adj[dpid][path[index + 1]][0]
+                outputs.setdefault(dpid, set()).add(port)
+                rank[dpid] = max(rank.get(dpid, 0), len(path) - index)
+        # Send downstream rules before ingress rules; timing is explicitly
+        # enqueue time, since OpenFlow 1.3 is not a cross-switch transaction.
+        for dpid in sorted(outputs, key=lambda n: rank[n]):
+            dp = self.dpid_conns[dpid]
+            ofp, par = dp.ofproto, dp.ofproto_parser
+            group_key = (dpid, *key)
+            ports = sorted(outputs[dpid])
+            if len(ports) > 1:
+                gid = self.groups.get(group_key)
+                command = ofp.OFPGC_MODIFY if gid is not None else ofp.OFPGC_ADD
+                if gid is None:
+                    gid = self.group_alloc.allocate((str(dpid) + "|" + key[0], key[1]))
+                    self.groups[group_key] = gid
+                buckets = [par.OFPBucket(weight=1, watch_port=ofp.OFPP_ANY,
+                    watch_group=ofp.OFPG_ANY, actions=[par.OFPActionOutput(p)]) for p in ports]
+                dp.send_msg(par.OFPGroupMod(dp, command, ofp.OFPGT_SELECT, gid, buckets))
+                actions = [par.OFPActionGroup(gid)]
+            else:
+                actions = [par.OFPActionOutput(ports[0])]
+            dp.send_msg(par.OFPFlowMod(dp, cookie=COOKIE, priority=FLOW_PRIORITY_PATH,
+                match=par.OFPMatch(eth_src=key[0], eth_dst=key[1]),
+                instructions=[par.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]))
+            self.metrics.flow_install_total.inc()
+        old_switches = {n for path in self.active_paths.get(key, []) for n in path}
+        for dpid in old_switches - outputs.keys():
+            dp = self.dpid_conns.get(dpid)
+            if dp and dpid in self.ready:
+                ofp, par = dp.ofproto, dp.ofproto_parser
+                dp.send_msg(par.OFPFlowMod(dp, cookie=COOKIE, cookie_mask=COOKIE_MASK,
+                    command=ofp.OFPFC_DELETE, out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+                    match=par.OFPMatch(eth_src=key[0], eth_dst=key[1])))
+        for group_key, gid in list(self.groups.items()):
+            dpid, src, dst = group_key
+            if (src, dst) == key and len(outputs.get(dpid, [])) < 2:
+                dp = self.dpid_conns.get(dpid)
+                if dp and dpid in self.ready:
+                    dp.send_msg(dp.ofproto_parser.OFPGroupMod(dp, dp.ofproto.OFPGC_DELETE,
+                                dp.ofproto.OFPGT_SELECT, gid))
+                del self.groups[group_key]
+                self.group_alloc.release((str(dpid) + "|" + src, dst))
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
-        dp   = ev.msg.datapath
-        body = ev.msg.body
-        for stat in body:
-            self._update_port_utilization(dp.id, stat)
+        if not self.is_primary:
+            return
+        changed = set()
+        for stat in ev.msg.body:
+            neighbor = self._update_port_utilization(ev.msg.datapath.id, stat)
+            if neighbor is not None:
+                changed |= self._affected(ev.msg.datapath.id, neighbor)
+        if changed:
+            self._recompute(changed, "congestion")
 
-    # -----------------------------------------------------------------------
-    # Private helpers
-    # -----------------------------------------------------------------------
-
-    def _port_stats_loop(self):
-        while True:
-            hub.sleep(PORT_STATS_INTERVAL)
-            for dpid, dp in list(self.dpid_conns.items()):
-                par = dp.ofproto_parser
-                req = par.OFPPortStatsRequest(dp, 0, dp.ofproto.OFPP_ANY)
-                dp.send_msg(req)
-
-    def _latency_probe_loop(self):
-        while True:
-            hub.sleep(LATENCY_PROBE_INTERVAL)
-            self._send_lldp_probes()
-
-    def _send_lldp_probes(self):
-        """Send a timestamped LLDP packet out every switch-to-switch port."""
-        for dpid, dp in list(self.dpid_conns.items()):
-            for neighbor, (out_port, _) in list(self.graph.adj.get(dpid, {}).items()):
-                ts_bytes = struct.pack("!d", time.time())
-                # Build a minimal LLDP packet with timestamp in system_name TLV
-                pkt = packet.Packet()
-                pkt.add_protocol(ethernet.ethernet(
-                    dst="01:80:c2:00:00:0e",
-                    src="00:00:00:00:00:01",
-                    ethertype=LLDP_ETHER_TYPE,
-                ))
-                chassis_id = lldp.ChassisID(
-                    subtype=lldp.ChassisID.SUB_LOCALLY_ASSIGNED,
-                    chassis_id=str(dpid).encode(),
-                )
-                port_id = lldp.PortID(
-                    subtype=lldp.PortID.SUB_PORT_COMPONENT,
-                    port_id=struct.pack("!H", out_port),
-                )
-                ttl = lldp.TTL(ttl=120)
-                end = lldp.End()
-                lldp_pkt = lldp.lldp(tlvs=[chassis_id, port_id, ttl, end])
-                pkt.add_protocol(lldp_pkt)
-                pkt.serialize()
-                self._lldp_timestamps[(dpid, out_port)] = time.time()
-                ofp = dp.ofproto
-                par = dp.ofproto_parser
-                actions = [par.OFPActionOutput(out_port)]
-                out = par.OFPPacketOut(
-                    datapath=dp,
-                    buffer_id=ofp.OFP_NO_BUFFER,
-                    in_port=ofp.OFPP_CONTROLLER,
-                    actions=actions,
-                    data=pkt.data,
-                )
-                dp.send_msg(out)
-
-    def _handle_lldp_probe(self, recv_dpid: int, in_port: int, pkt):
-        """Match received LLDP to a sent probe and update latency."""
-        try:
-            lldp_pkt = pkt.get_protocol(lldp.lldp)
-            if lldp_pkt is None:
-                return
-            src_dpid_bytes = lldp_pkt.tlvs[0].chassis_id
-            src_dpid = int(src_dpid_bytes.decode())
-            src_port_bytes = lldp_pkt.tlvs[1].port_id
-            src_port = struct.unpack("!H", src_port_bytes)[0]
-            send_ts = self._lldp_timestamps.get((src_dpid, src_port))
-            if send_ts is None:
-                return
-            rtt_ms = (time.time() - send_ts) * 1000
-            latency_ms = rtt_ms / 2.0
-            # Update link metrics in graph
-            if src_dpid in self.graph.adj and recv_dpid in self.graph.adj[src_dpid]:
-                _, old_m = self.graph.adj[src_dpid][recv_dpid]
-                new_m = LinkMetrics(
-                    latency_ms=latency_ms,
-                    bandwidth_mbps=old_m.bandwidth_mbps,
-                    loss_rate=old_m.loss_rate,
-                    utilization=old_m.utilization,
-                )
-                self.graph.update_metrics(src_dpid, recv_dpid, new_m)
-                log.debug("Latency %016x<->%016x = %.2fms", src_dpid, recv_dpid, latency_ms)
-        except Exception as e:
-            log.debug("LLDP probe parse error: %s", e)
-
-    def _update_port_utilization(self, dpid: int, stat) -> None:
+    def _update_port_utilization(self, dpid, stat):
+        now = time.monotonic()
         key = (dpid, stat.port_no)
-        prev = self.port_prev_stats.get(key)
-        now_stats = {
-            "tx_bytes": stat.tx_bytes,
-            "rx_bytes": stat.rx_bytes,
-            "tx_dropped": stat.tx_dropped,
-            "rx_dropped": stat.rx_dropped,
-            "ts": time.time(),
-        }
-        if prev:
-            dt = now_stats["ts"] - prev["ts"]
-            if dt > 0:
-                delta_bytes = (now_stats["tx_bytes"] - prev["tx_bytes"] +
-                               now_stats["rx_bytes"] - prev["rx_bytes"])
-                delta_drops = (now_stats["tx_dropped"] - prev["tx_dropped"] +
-                               now_stats["rx_dropped"] - prev["rx_dropped"])
-                # Find what neighbor this port connects to
-                neighbor = self._port_to_neighbor(dpid, stat.port_no)
-                if neighbor is not None:
-                    _, m = self.graph.adj[dpid][neighbor]
-                    total_bytes_capacity = m.bandwidth_mbps * 1e6 / 8 * dt
-                    utilization = min(delta_bytes / max(total_bytes_capacity, 1), 1.0)
-                    loss_rate = delta_drops / max(delta_bytes + delta_drops, 1)
-                    new_m = LinkMetrics(
-                        latency_ms=m.latency_ms,
-                        bandwidth_mbps=m.bandwidth_mbps,
-                        loss_rate=loss_rate,
-                        utilization=utilization,
-                    )
-                    self.graph.update_metrics(dpid, neighbor, new_m)
-                    # Proactive rebalancing
-                    if utilization > UTIL_THRESHOLD:
-                        log.info("Utilization %.1f%% on %016x->%016x — rebalancing",
-                                 utilization * 100, dpid, neighbor)
-                        self._rebalance_link(dpid, neighbor)
-        self.port_prev_stats[key] = now_stats
-
-    def _rebalance_link(self, dpid1: int, dpid2: int) -> None:
-        """Rebalance flows that use the congested link."""
-        for key, path in list(self.active_paths.items()):
-            if self._path_uses_link(path, dpid1, dpid2):
-                self._reroute(key, time.time(), reason="congestion")
-
-    def _reroute(self, key: Tuple, t0: float, reason: str = "failure") -> None:
-        src_mac, dst_mac = key
-        src_loc = self.graph.hosts.get(src_mac)
-        dst_loc = self.graph.hosts.get(dst_mac)
-        if not src_loc or not dst_loc:
-            return
-        paths = self.graph.ecmp_paths(src_loc.dpid, dst_loc.dpid)
-        if not paths:
-            log.error("RECOVERY FAILED: no alternate path for %s->%s", src_mac, dst_mac)
-            return
-
-        # Remove stale flows
-        old_path = self.active_paths.get(key, [])
-        self._delete_path_flows(old_path, src_mac, dst_mac)
-
-        # Install new path(s)
-        if len(paths) > 1:
-            self._install_ecmp(paths, key, src_mac, dst_mac, dst_loc.port)
-        else:
-            self._install_path(paths[0], key, src_mac, dst_mac, dst_loc.port)
-        self.active_paths[key] = paths[0]
-
-        elapsed_ms = (time.time() - t0) * 1000
-        entry = {
-            "src_mac": src_mac, "dst_mac": dst_mac,
-            "reason": reason,
-            "recovery_ms": elapsed_ms,
-            "new_path": paths[0],
-            "ts": time.time(),
-        }
-        self.recovery_log.append(entry)
-        self.metrics.recovery_time_ms.observe(elapsed_ms)
-        log.info("RECOVERY [%s]: %s->%s in %.1fms via %s",
-                 reason, src_mac, dst_mac, elapsed_ms, paths[0])
-
-    def _install_path(self, path: List[int], key: Tuple,
-                      src_mac: str, dst_mac: str, dst_port: int) -> None:
-        hops = self.graph.path_to_port_sequence(path)
-        for i, (dpid, out_port) in enumerate(hops):
-            dp  = self.dpid_conns.get(dpid)
-            if dp is None:
+        values = (stat.tx_bytes, stat.tx_packets, stat.tx_dropped)
+        previous = self.port_prev_stats.get(key)
+        self.port_prev_stats[key] = (now, values)
+        if previous is None or now <= previous[0]:
+            return None
+        delta = [current - old for current, old in zip(values, previous[1])]
+        if any(value < 0 for value in delta):
+            return None
+        for neighbor, (port, metrics) in self.graph.adj.get(dpid, {}).items():
+            if port != stat.port_no:
                 continue
-            ofp = dp.ofproto
-            par = dp.ofproto_parser
-            match   = par.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
-            actions = [par.OFPActionOutput(out_port)]
-            inst    = [par.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-            mod = par.OFPFlowMod(
-                datapath=dp,
-                priority=FLOW_PRIORITY_PATH,
-                idle_timeout=FLOW_IDLE_TIMEOUT,
-                match=match, instructions=inst,
-            )
-            dp.send_msg(mod)
-            self.metrics.flow_install_total.inc()
-        # Install final hop (switch attached to dst host)
-        if path:
-            last_dpid = path[-1]
-            dp = self.dpid_conns.get(last_dpid)
-            if dp:
-                ofp = dp.ofproto
-                par = dp.ofproto_parser
-                match   = par.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
-                actions = [par.OFPActionOutput(dst_port)]
-                inst    = [par.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-                mod = par.OFPFlowMod(
-                    datapath=dp,
-                    priority=FLOW_PRIORITY_PATH,
-                    idle_timeout=FLOW_IDLE_TIMEOUT,
-                    match=match, instructions=inst,
-                )
-                dp.send_msg(mod)
-                self.metrics.flow_install_total.inc()
-        self.metrics.active_flows.inc()
-
-    def _install_ecmp(self, paths: List[List[int]], key: Tuple,
-                      src_mac: str, dst_mac: str, dst_port: int) -> None:
-        """Install an OF1.3 group table entry to split traffic across paths."""
-        if not paths:
-            return
-        # Use first switch of the first path to create the group
-        first_dpid = paths[0][0]
-        dp = self.dpid_conns.get(first_dpid)
-        if dp is None:
-            # Fallback: install only the first path
-            self._install_path(paths[0], key, src_mac, dst_mac, dst_port)
-            return
-
-        ofp = dp.ofproto
-        par = dp.ofproto_parser
-
-        # Build one bucket per path
-        buckets = []
-        for path in paths:
-            if len(path) > 1:
-                out_port = self.graph.adj[path[0]][path[1]][0]
-            else:
-                out_port = dst_port
-            actions = [par.OFPActionOutput(out_port)]
-            buckets.append(par.OFPBucket(
-                weight=1,
-                watch_port=out_port,
-                watch_group=ofp.OFPG_ANY,
-                actions=actions,
-            ))
-
-        group_id = self.group_alloc.allocate(key)
-        dp.send_msg(par.OFPGroupMod(
-            datapath=dp,
-            command=ofp.OFPGC_ADD,
-            type_=ofp.OFPGT_SELECT,
-            group_id=group_id,
-            buckets=buckets,
-        ))
-
-        # Install path rules for all switches beyond the first
-        for path in paths:
-            self._install_path(path, key, src_mac, dst_mac, dst_port)
-
-        log.info("ECMP group %d installed (%d paths) for %s->%s",
-                 group_id, len(paths), src_mac, dst_mac)
-
-    def _delete_path_flows(self, path: List[int],
-                           src_mac: str, dst_mac: str) -> None:
-        for dpid in path:
-            dp = self.dpid_conns.get(dpid)
-            if dp is None:
-                continue
-            ofp = dp.ofproto
-            par = dp.ofproto_parser
-            match = par.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
-            mod   = par.OFPFlowMod(
-                datapath=dp,
-                command=ofp.OFPFC_DELETE,
-                out_port=ofp.OFPP_ANY,
-                out_group=ofp.OFPG_ANY,
-                priority=FLOW_PRIORITY_PATH,
-                match=match,
-            )
-            dp.send_msg(mod)
-
-    def _flood(self, dp, msg, in_port: int) -> None:
-        ofp  = dp.ofproto
-        par  = dp.ofproto_parser
-        data = msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None
-        out  = par.OFPPacketOut(
-            datapath=dp,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=[par.OFPActionOutput(ofp.OFPP_FLOOD)],
-            data=data,
-        )
-        dp.send_msg(out)
-
-    def _send_packet_out(self, dp, msg, in_port: int, out_port: int) -> None:
-        ofp  = dp.ofproto
-        par  = dp.ofproto_parser
-        data = msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None
-        out  = par.OFPPacketOut(
-            datapath=dp,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=[par.OFPActionOutput(out_port)],
-            data=data,
-        )
-        dp.send_msg(out)
-
-    def _is_switch_port(self, dpid: int, port: int) -> bool:
-        return any(p == port for _, (p, _) in self.graph.adj.get(dpid, {}).items())
-
-    def _path_uses_link(self, path: List[int], a: int, b: int) -> bool:
-        for i in range(len(path) - 1):
-            if (path[i] == a and path[i+1] == b) or \
-               (path[i] == b and path[i+1] == a):
-                return True
-        return False
-
-    def _port_to_neighbor(self, dpid: int, port: int) -> Optional[int]:
-        for neighbor, (p, _) in self.graph.adj.get(dpid, {}).items():
-            if p == port:
+            utilization = min(1.0, delta[0] * 8 / ((now - previous[0]) * self.capacity * 1e6))
+            loss = delta[2] / max(delta[1] + delta[2], 1)
+            self.graph.adj[dpid][neighbor] = (port, LinkMetrics(
+                latency_ms=metrics.latency_ms, bandwidth_mbps=self.capacity,
+                utilization=utilization, loss_rate=loss))
+            self.metrics.link_utilization.labels(str(dpid), str(neighbor)).set(utilization)
+            if abs(utilization - metrics.utilization) >= 0.15:
                 return neighbor
         return None
 
-    def _first_hop_port(self, dpid: int, path: List[int]) -> int:
-        if len(path) < 2:
-            return 1
-        _, (port, _) = dpid, self.graph.adj[dpid].get(path[1], (1, None))
-        return self.graph.adj[dpid][path[1]][0] if path[1] in self.graph.adj.get(dpid, {}) else 1
+    @set_ev_cls(ofp_event.EventOFPErrorMsg, [CONFIG_DISPATCHER, MAIN_DISPATCHER])
+    def error_handler(self, ev):
+        dp = ev.msg.datapath
+        if (not self.is_primary and ev.msg.type == dp.ofproto.OFPET_ROLE_REQUEST_FAILED
+                and ev.msg.code == dp.ofproto.OFPRRFC_STALE):
+            # Another controller may promote between our NOCHANGE query and
+            # SLAVE request. Refresh the epoch and retry this expected race.
+            self._request_role(dp)
+            return
+        self.metrics.openflow_errors.inc()
+        log.error("OpenFlow error switch=%s type=%s code=%s data=%r",
+                  ev.msg.datapath.id, ev.msg.type, ev.msg.code, ev.msg.data)
+
+    def _maintenance(self):
+        iteration = 0
+        while self.is_active:
+            if self.election:
+                self.election.tick()
+                if self.is_primary:
+                    try:
+                        if not self.election.sync.push_state(self.election.instance_id, self._snapshot()):
+                            self.election.demote()
+                    except Exception:
+                        self.election.demote()
+            self.metrics.controller_role.set(self.is_primary)
+            if self.is_primary:
+                self._send_discovery()
+                now = time.monotonic()
+                for (a, b), seen in list(self.link_seen.items()):
+                    if now - seen > LINK_TIMEOUT:
+                        affected = self._affected(a, b)
+                        self._remove_link(a, b)
+                        self._recompute(affected, "discovery_timeout")
+                if iteration % STATS_INTERVAL == 0:
+                    for dpid in list(self.ready):
+                        dp = self.dpid_conns[dpid]
+                        dp.send_msg(dp.ofproto_parser.OFPPortStatsRequest(dp, 0, dp.ofproto.OFPP_ANY))
+            iteration += 1
+            hub.sleep(DISCOVERY_INTERVAL)
+
+    def close(self):
+        if self.election:
+            self.election.stop()
+        if self._worker:
+            hub.kill(self._worker)
+        super().close()
