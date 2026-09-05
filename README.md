@@ -129,6 +129,10 @@ different topologies. Logs and JSON results go
 to `benchmarks/live/`. GitHub Actions runs these checks and builds/starts the
 Compose stack.
 
+Recovery checks wait up to ten seconds for three consecutive successful pings
+and retain every preceding probe's sent/received counts. Baseline and final
+all-pairs checks require zero loss without retries.
+
 For continuous packet sampling against an already running standalone controller:
 
 ```bash

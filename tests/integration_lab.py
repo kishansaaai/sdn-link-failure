@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -37,11 +38,26 @@ def wait_for(predicate, timeout=20, message="condition"):
     raise AssertionError(f"Timed out waiting for {message}: {last}")
 
 
-def ping(source, destination, count=3):
-    output = source.cmd(f"ping -n -c {count} -W 1 -i 0.1 {destination.IP()}")
-    if "0% packet loss" not in output or "100% packet loss" in output:
-        raise AssertionError(output)
-    return output
+def ping(source, destination, count=3, timeout=10):
+    """Wait for packet recovery, recording every probe including transient loss.
+
+    A topology API update precedes switch execution. A first packet may still
+    be lost during replacement; require eventual consecutive success within a
+    bound instead of confusing graph readiness with lossless dataplane updates.
+    Baseline/final all-pairs checks remain strict with no retry.
+    """
+    deadline = time.monotonic() + timeout
+    attempts = []
+    while time.monotonic() < deadline:
+        output = source.cmd(f"ping -n -c {count} -W 1 -i 0.1 {destination.IP()}")
+        summary = re.search(r"(\d+) packets transmitted, (\d+) received", output)
+        if summary:
+            sent, received = map(int, summary.groups())
+            attempts.append({"sent": sent, "received": received})
+            if sent == received == count:
+                return attempts
+        time.sleep(0.1)
+    raise AssertionError(f"Packet recovery failed within {timeout}s: {attempts}; {output}")
 
 
 def run_topology(name, python, datapath, output_dir):
@@ -98,11 +114,11 @@ def run_topology(name, python, datapath, output_dir):
                 all({u, v} != {a, b} for u, v in zip(path, path[1:]))
                 for path in record["paths"])
         wait_for(recovered, message="alternate route")
-        ping(source, destination)
+        result["failure_recovery_probes"] = ping(source, destination)
         result["failure_to_verified_ping_ms"] = (time.monotonic() - start) * 1000
         net.configLinkStatus(by_dpid[a], by_dpid[b], "up")
         wait_for(lambda: str(b) in get_json(15000, "topology")["adj"][str(a)], message="restoration")
-        ping(source, destination)
+        result["restoration_probes"] = ping(source, destination)
         result["restoration"] = "passed"
         # Isolate the destination switch; stale rules must disappear, then return.
         destination_dpid = get_json(15000, "topology")["hosts"][destination.MAC()]["dpid"]
@@ -116,7 +132,7 @@ def run_topology(name, python, datapath, output_dir):
             net.configLinkStatus(by_dpid[destination_dpid], by_dpid[int(neighbor)], "up")
         wait_for(lambda: len(get_json(15000, "topology")["adj"][str(destination_dpid)]) == len(adjacent),
                  message="partition healing")
-        ping(source, destination)
+        result["partition_healing_probes"] = ping(source, destination)
         result["partition_and_healing"] = "passed"
         # Allow one snapshot, kill the lease owner, and verify backup writes.
         time.sleep(1.5)
@@ -125,7 +141,7 @@ def run_topology(name, python, datapath, output_dir):
         primary.wait(timeout=5)
         wait_for(lambda: get_json(15001, "health")["role"] == "primary", timeout=12, message="HA takeover")
         wait_for(lambda: get_json(15001, "health")["ready_switches"] == len(net.switches), message="backup master roles")
-        ping(source, destination)
+        result["takeover_probes"] = ping(source, destination)
         result["controller_takeover_ms"] = (time.monotonic() - start) * 1000
         # A new link failure after takeover proves active control, not stale flows.
         route = next(p for p in get_json(15001, "paths") if p["src_mac"] == source.MAC()
@@ -133,7 +149,7 @@ def run_topology(name, python, datapath, output_dir):
         a, b = route[:2]
         net.configLinkStatus(by_dpid[a], by_dpid[b], "down")
         wait_for(lambda: str(b) not in get_json(15001, "topology")["adj"][str(a)], message="backup handles failure")
-        ping(source, destination)
+        result["failure_after_takeover_probes"] = ping(source, destination)
         net.configLinkStatus(by_dpid[a], by_dpid[b], "up")
         wait_for(lambda: str(b) in get_json(15001, "topology")["adj"][str(a)], message="backup handles restoration")
         result["failure_after_takeover"] = "passed"

@@ -41,3 +41,29 @@ def test_pdml_retains_coalesced_openflow_messages():
     events = parse_pdml(xml)
     assert len(events) == 2 and events[0].port_down
     assert events[1].command == 0
+
+def test_integration_recovery_retains_transient_packet_loss(monkeypatch):
+    from types import SimpleNamespace
+    from tests.integration_lab import ping
+    replies = iter([
+        "3 packets transmitted, 2 received, 33.3333% packet loss",
+        "3 packets transmitted, 3 received, 0% packet loss",
+    ])
+    source = SimpleNamespace(cmd=lambda command: next(replies))
+    destination = SimpleNamespace(IP=lambda: "10.0.0.2")
+    monkeypatch.setattr("tests.integration_lab.time.sleep", lambda seconds: None)
+    assert ping(source, destination) == [
+        {"sent": 3, "received": 2}, {"sent": 3, "received": 3}]
+
+
+def test_integration_recovery_has_a_deadline(monkeypatch):
+    import pytest
+    from types import SimpleNamespace
+    from tests.integration_lab import ping
+    clock = iter([0, 0, 2])
+    monkeypatch.setattr("tests.integration_lab.time.monotonic", lambda: next(clock))
+    monkeypatch.setattr("tests.integration_lab.time.sleep", lambda seconds: None)
+    source = SimpleNamespace(cmd=lambda command: "3 packets transmitted, 0 received")
+    destination = SimpleNamespace(IP=lambda: "10.0.0.2")
+    with pytest.raises(AssertionError, match="Packet recovery failed"):
+        ping(source, destination, timeout=1)
