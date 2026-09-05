@@ -1,107 +1,77 @@
-"""
-state_sync.py — Redis-backed topology + flow state synchronisation.
-
-Primary controller writes state every heartbeat interval.
-Backup controller reads state and takes over if the heartbeat TTL expires.
-"""
+"""Owner-checked Redis leases and atomic, fenced controller snapshots."""
 from __future__ import annotations
-
 import json
-import logging
 import os
 import time
-from typing import Optional
+import redis
 
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
+HEARTBEAT_KEY = "sdn:heartbeat"
+STATE_KEY = "sdn:topology_state"
+GENERATION_KEY = "sdn:generation"
+HEARTBEAT_TTL = 5
+HEARTBEAT_INTERVAL = 1
 
-log = logging.getLogger(__name__)
-
-REDIS_HOST      = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT      = int(os.getenv("REDIS_PORT", "6379"))
-HEARTBEAT_KEY   = "sdn:heartbeat"
-STATE_KEY        = "sdn:topology_state"
-HEARTBEAT_TTL   = 5    # seconds — backup promotes if this expires
-HEARTBEAT_INTERVAL = 2  # seconds between primary writes
+ACQUIRE = """
+if redis.call('exists', KEYS[1]) == 0 then
+  local generation = redis.call('incr', KEYS[2])
+  redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2])
+  return generation
+end
+return 0
+"""
+RENEW = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  redis.call('expire', KEYS[1], ARGV[2])
+  return 1
+end
+return 0
+"""
+PUBLISH = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  redis.call('set', KEYS[2], ARGV[2])
+  return 1
+end
+return 0
+"""
+RELEASE = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
 
 
 class StateSync:
-    """
-    Thin wrapper around Redis for SDN controller state sharing.
-    Falls back to a no-op if Redis is not available (single-controller mode).
-    """
+    def __init__(self, client=None):
+        self._redis = client if client is not None else redis.Redis(
+            host=os.getenv("REDIS_HOST", "127.0.0.1"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            decode_responses=True, socket_connect_timeout=0.5, socket_timeout=0.5,
+        )
 
-    def __init__(self):
-        self._redis: Optional[object] = None
-        if REDIS_AVAILABLE:
-            try:
-                self._redis = redis.Redis(
-                    host=REDIS_HOST, port=REDIS_PORT,
-                    decode_responses=True, socket_connect_timeout=2,
-                )
-                self._redis.ping()
-                log.info("Redis connected at %s:%d", REDIS_HOST, REDIS_PORT)
-            except Exception as e:
-                log.warning("Redis unavailable (%s) — running in standalone mode", e)
-                self._redis = None
-        else:
-            log.warning("redis-py not installed — running in standalone mode")
+    def acquire(self, owner: str) -> int:
+        return int(self._redis.eval(ACQUIRE, 2, HEARTBEAT_KEY, GENERATION_KEY,
+                                    owner, HEARTBEAT_TTL))
 
-    @property
-    def available(self) -> bool:
-        return self._redis is not None
+    def renew(self, owner: str) -> bool:
+        return bool(self._redis.eval(RENEW, 1, HEARTBEAT_KEY, owner, HEARTBEAT_TTL))
 
-    # ------------------------------------------------------------------
-    # Heartbeat (primary → Redis → backup monitors)
-    # ------------------------------------------------------------------
+    def release(self, owner: str) -> None:
+        self._redis.eval(RELEASE, 1, HEARTBEAT_KEY, owner)
 
-    def write_heartbeat(self, instance_id: str) -> None:
-        """Primary calls this in a loop. TTL auto-expires if primary dies."""
-        if not self._redis:
-            return
-        try:
-            self._redis.setex(HEARTBEAT_KEY, HEARTBEAT_TTL, instance_id)
-        except Exception as e:
-            log.warning("Heartbeat write failed: %s", e)
+    def read_heartbeat(self):
+        # Connection failures deliberately propagate; they are not lease expiry.
+        return self._redis.get(HEARTBEAT_KEY)
 
-    def read_heartbeat(self) -> Optional[str]:
-        """Returns current primary instance_id, or None if key expired."""
-        if not self._redis:
-            return "standalone"
-        try:
-            return self._redis.get(HEARTBEAT_KEY)
-        except Exception:
+    def push_state(self, owner: str, state: dict) -> bool:
+        payload = json.dumps({**state, "ts": time.time(), "version": 1}, allow_nan=False)
+        return bool(self._redis.eval(PUBLISH, 2, HEARTBEAT_KEY, STATE_KEY, owner, payload))
+
+    def pull_state(self) -> dict | None:
+        raw = self._redis.get(STATE_KEY)
+        if raw is None:
             return None
-
-    def is_primary_alive(self) -> bool:
-        return self.read_heartbeat() is not None
-
-    # ------------------------------------------------------------------
-    # Topology state (primary writes, backup reads on takeover)
-    # ------------------------------------------------------------------
-
-    def push_state(self, graph_dict: dict, recovery_log: list) -> None:
-        if not self._redis:
-            return
-        try:
-            payload = json.dumps({
-                "graph": graph_dict,
-                "recovery_log": recovery_log,
-                "ts": time.time(),
-            })
-            self._redis.set(STATE_KEY, payload)
-        except Exception as e:
-            log.warning("State push failed: %s", e)
-
-    def pull_state(self) -> Optional[dict]:
-        if not self._redis:
-            return None
-        try:
-            raw = self._redis.get(STATE_KEY)
-            return json.loads(raw) if raw else None
-        except Exception as e:
-            log.warning("State pull failed: %s", e)
-            return None
+        data = json.loads(raw)
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise ValueError("Unsupported controller snapshot")
+        return data

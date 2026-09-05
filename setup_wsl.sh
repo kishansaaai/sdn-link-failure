@@ -1,9 +1,8 @@
-#!/bin/bash
-set -ex
-cd /mnt/c/Users/saiki/OneDrive/Documents/Desktop/sdn-link-failure
-rm -rf venv310
-python3.10 -m venv --without-pip venv310
-curl -sS https://bootstrap.pypa.io/get-pip.py | venv310/bin/python
-source venv310/bin/activate
-pip install setuptools==57.5.0 wheel
-pip install -r requirements.txt
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "$(readlink -f -- "$0")")"
+python_bin="${PYTHON_BIN:-python3.10}"
+"$python_bin" -m venv .venv
+.venv/bin/python -m pip install pip==24.0 setuptools==57.5.0 wheel==0.42.0
+.venv/bin/python -m pip install --no-build-isolation -r requirements.txt -r requirements-dev.txt
+printf '%s\n' 'Ready. Start with .venv/bin/python start_ryu.py'

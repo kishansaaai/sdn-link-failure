@@ -1,11 +1,6 @@
-ryu
-flask
-prometheus_client
-redis
-requests
-numpy
-matplotlib
-pytest
-pytest-cov
-mypy
-ruff
+# Controller runtime: Python 3.10. See setup_wsl.sh for Ryu build prerequisites.
+ryu==4.34
+eventlet==0.33.3
+redis==5.0.8
+prometheus-client==0.21.1
+requests==2.32.3

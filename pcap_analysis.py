@@ -1,197 +1,107 @@
 #!/usr/bin/env python3
-"""
-pcap_analysis.py — Packet-level proof using tshark.
+"""Inspect OF1.3 control-channel evidence; this does not prove packet recovery.
 
-Captures OpenFlow control-channel traffic during a chaos test and
-programmatically asserts the expected event sequence:
-  OFPT_PORT_STATUS(down) → OFPT_FLOW_MOD (install) within window → OFPT_FLOW_MOD (delete stale)
-
-Usage:
-    # Capture during a test (requires tshark + sudo)
-    sudo python3 pcap_analysis.py --capture --duration 30 --out capture.pcap
-
-    # Analyse an existing pcap
-    python3 pcap_analysis.py --analyse capture.pcap --recovery-window-ms 500
+Capture: python3 pcap_analysis.py capture --duration 30 --out capture.pcap
+Analyse: python3 pcap_analysis.py analyse capture.pcap --recovery-window-ms 500
+The strict check needs a capture where each observed down port affects a route.
 """
 from __future__ import annotations
-
 import argparse
-import json
-import subprocess
-import sys
-import tempfile
-import time
+from collections import Counter
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import subprocess
+import xml.etree.ElementTree as ET
 
-
-OF_PORT = 6633
-OF_TYPES = {
-    0:  "OFPT_HELLO",
-    2:  "OFPT_ERROR",
-    4:  "OFPT_FEATURES_REQUEST",
-    5:  "OFPT_FEATURES_REPLY",
-    10: "OFPT_PACKET_IN",
-    12: "OFPT_PORT_STATUS",
-    13: "OFPT_PACKET_OUT",
-    14: "OFPT_FLOW_MOD",
-    16: "OFPT_STATS_REQUEST",
-    17: "OFPT_STATS_REPLY",
-}
+OF_TYPES = {0: "HELLO", 1: "ERROR", 2: "ECHO_REQUEST", 3: "ECHO_REPLY",
+            5: "FEATURES_REQUEST", 6: "FEATURES_REPLY", 10: "PACKET_IN",
+            12: "PORT_STATUS", 13: "PACKET_OUT", 14: "FLOW_MOD", 15: "GROUP_MOD",
+            18: "MULTIPART_REQUEST", 19: "MULTIPART_REPLY",
+            20: "BARRIER_REQUEST", 21: "BARRIER_REPLY", 24: "ROLE_REQUEST", 25: "ROLE_REPLY"}
 
 
 @dataclass
 class OFEvent:
-    ts:      float
+    ts: float
     of_type: int
-    type_name: str
-    info:    str
+    type_name: str = ""
+    info: str = ""
+    stream: int = -1
+    port_down: bool = False
+    command: int | None = None
 
 
-# ---------------------------------------------------------------------------
-# Capture
-# ---------------------------------------------------------------------------
-
-def capture(duration: int, out_file: str, iface: str = "lo") -> None:
-    print(f"[pcap] Capturing on {iface} for {duration}s → {out_file}")
-    cmd = [
-        "tshark", "-i", iface,
-        "-f", f"tcp port {OF_PORT}",
-        "-w", out_file,
-        "-a", f"duration:{duration}",
-    ]
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"[pcap] Capture complete: {out_file}")
-    except FileNotFoundError:
-        print("ERROR: tshark not found. Install with: sudo apt-get install tshark")
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: tshark failed: {e}")
-        sys.exit(1)
+def capture(duration, out_file, iface="lo", port=6633):
+    subprocess.run(["tshark", "-i", iface, "-f", f"tcp port {port}",
+                    "-w", out_file, "-a", f"duration:{duration}"], check=True)
 
 
-# ---------------------------------------------------------------------------
-# Parse
-# ---------------------------------------------------------------------------
-
-def parse_pcap(pcap_file: str) -> List[OFEvent]:
-    """Use tshark to extract OF message types and timestamps."""
-    cmd = [
-        "tshark", "-r", pcap_file,
-        "-T", "fields",
-        "-e", "frame.time_epoch",
-        "-e", "openflow_v4.type",
-        "-e", "openflow_v4.ofp_header.type",
-        "-Y", "openflow_v4",
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except FileNotFoundError:
-        print("ERROR: tshark not found.")
-        sys.exit(1)
-
-    events: List[OFEvent] = []
-    for line in result.stdout.splitlines():
-        parts = line.strip().split("\t")
-        if len(parts) < 2:
-            continue
-        try:
-            ts = float(parts[0])
-            of_type_str = parts[1] or parts[2] if len(parts) > 2 else parts[1]
-            of_type = int(of_type_str)
-            events.append(OFEvent(
-                ts=ts,
-                of_type=of_type,
-                type_name=OF_TYPES.get(of_type, f"OFPT_{of_type}"),
-                info="",
-            ))
-        except (ValueError, IndexError):
-            continue
-    return events
+def parse_pdml(text):
+    """PDML preserves multiple OpenFlow messages coalesced into a TCP frame."""
+    result = []
+    for frame in ET.fromstring(text).findall("packet"):
+        fields = {f.get("name"): f.get("show") for f in frame.iter("field")}
+        ts = float(fields.get("frame.time_epoch", "0"))
+        stream = int(fields.get("tcp.stream", "-1"))
+        for proto in frame.findall(".//proto[@name='openflow_v4']"):
+            values = {f.get("name"): f.get("show") for f in proto.iter("field")}
+            if "openflow_v4.type" not in values:
+                continue
+            kind = int(values["openflow_v4.type"], 0)
+            down = (values.get("openflow_v4.port.state.link_down") == "1"
+                    or values.get("openflow_v4.port.config.port_down") == "1"
+                    or values.get("openflow_v4.port_status.reason") == "1")
+            command = values.get("openflow_v4.flowmod.command")
+            result.append(OFEvent(ts, kind, OF_TYPES.get(kind, str(kind)),
+                                  stream=stream, port_down=down,
+                                  command=int(command, 0) if command else None))
+    return sorted(result, key=lambda event: event.ts)
 
 
-# ---------------------------------------------------------------------------
-# Assert sequence
-# ---------------------------------------------------------------------------
+def parse_pcap(pcap_file, port=6633):
+    output = subprocess.run(["tshark", "-r", str(pcap_file), "-d", f"tcp.port=={port},openflow",
+                             "-Y", "openflow_v4", "-T", "pdml"],
+                            capture_output=True, text=True, check=True)
+    return parse_pdml(output.stdout)
 
-def assert_recovery_sequence(events: List[OFEvent],
-                              window_ms: float = 500.0) -> bool:
-    """
-    Assert that for every PORT_STATUS(down) event, a FLOW_MOD install
-    appears within `window_ms` milliseconds.
 
-    Returns True if all assertions pass.
-    """
-    PORT_STATUS = 12
-    FLOW_MOD    = 14
-    window_s    = window_ms / 1000.0
+def assert_recovery_sequence(events, window_ms=500):
+    if window_ms <= 0:
+        raise ValueError("Recovery window must be positive")
+    downs = [e for e in events if e.of_type == 12 and e.port_down]
+    if not downs:
+        print("No port-down evidence; recovery cannot be verified.")
+        return False
     passed = True
-
-    port_downs = [e for e in events if e.of_type == PORT_STATUS]
-    if not port_downs:
-        print("[assert] No OFPT_PORT_STATUS events found — nothing to verify.")
-        return True
-
-    print(f"\n[assert] Found {len(port_downs)} PORT_STATUS events")
-    for pd in port_downs:
-        # Find a FLOW_MOD within the window after this event
-        candidates = [
-            e for e in events
-            if e.of_type == FLOW_MOD and 0 <= e.ts - pd.ts <= window_s
-        ]
-        if candidates:
-            delta_ms = (candidates[0].ts - pd.ts) * 1000
-            print(f"  ✓ PORT_STATUS @ {pd.ts:.3f}s → FLOW_MOD in {delta_ms:.1f}ms")
-        else:
-            print(f"  ✗ PORT_STATUS @ {pd.ts:.3f}s — no FLOW_MOD within {window_ms}ms window")
+    for down in downs:
+        candidates = [e for e in events if e.of_type == 14 and e.command in (0, 1, 2)
+                      and e.stream == down.stream
+                      and 0 <= (e.ts - down.ts) * 1000 <= window_ms]
+        if not candidates:
+            print(f"No add/modify on stream {down.stream} within {window_ms} ms of {down.ts}")
             passed = False
-
-    if passed:
-        print("\n[assert] ✓ All recovery sequences verified within window.")
-    else:
-        print("\n[assert] ✗ Some recovery sequences exceeded the window — check controller.")
     return passed
 
 
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    cap = commands.add_parser("capture")
+    cap.add_argument("--duration", type=int, default=30)
+    cap.add_argument("--out", default="capture.pcap")
+    cap.add_argument("--iface", default="lo")
+    cap.add_argument("--port", type=int, default=6633)
+    analyze = commands.add_parser("analyse")
+    analyze.add_argument("pcap")
+    analyze.add_argument("--port", type=int, default=6633)
+    analyze.add_argument("--recovery-window-ms", type=float, default=500)
+    args = parser.parse_args()
+    if args.command == "capture":
+        capture(args.duration, args.out, args.iface, args.port)
+    else:
+        events = parse_pcap(args.pcap, args.port)
+        print(dict(Counter(event.type_name for event in events)))
+        raise SystemExit(0 if assert_recovery_sequence(events, args.recovery_window_ms) else 1)
 
-def print_summary(events: List[OFEvent]) -> None:
-    from collections import Counter
-    counts = Counter(e.type_name for e in events)
-    print("\n── OpenFlow Message Summary ──────────────────────────")
-    for name, count in sorted(counts.items(), key=lambda x: -x[1]):
-        print(f"  {name:<30} {count:>5}")
-    print("─────────────────────────────────────────────────────\n")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OpenFlow pcap analysis tool")
-    subp = parser.add_subparsers(dest="cmd")
-
-    cap_p = subp.add_parser("capture")
-    cap_p.add_argument("--duration", type=int, default=30)
-    cap_p.add_argument("--out", default="capture.pcap")
-    cap_p.add_argument("--iface", default="lo")
-
-    ana_p = subp.add_parser("analyse")
-    ana_p.add_argument("pcap")
-    ana_p.add_argument("--recovery-window-ms", type=float, default=500.0)
-
-    args = parser.parse_args()
-
-    if args.cmd == "capture":
-        capture(args.duration, args.out, args.iface)
-    elif args.cmd == "analyse":
-        events = parse_pcap(args.pcap)
-        print_summary(events)
-        ok = assert_recovery_sequence(events, args.recovery_window_ms)
-        sys.exit(0 if ok else 1)
-    else:
-        parser.print_help()
+    main()

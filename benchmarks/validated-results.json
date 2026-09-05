@@ -1,0 +1,144 @@
+{
+  "date": "2026-09-05",
+  "environment": {
+    "os": "Ubuntu 24.04 under WSL2",
+    "controller_python": "3.10.20",
+    "openvswitch": "3.3.4",
+    "datapath": "userspace/netdev",
+    "bandwidth_shaping": false
+  },
+  "integration": [
+    {
+      "topology": "ring",
+      "baseline_loss_pct": 0.0,
+      "ecmp_routes": 4,
+      "failure_to_verified_ping_ms": 415.0446799999372,
+      "restoration": "passed",
+      "partition_and_healing": "passed",
+      "controller_takeover_ms": 5708.304887000054,
+      "failure_after_takeover": "passed",
+      "former_primary_restart": "passed",
+      "final_loss_pct": 0.0,
+      "recovery_events": 66,
+      "openflow_errors": 0,
+      "status": "passed"
+    },
+    {
+      "topology": "mesh",
+      "baseline_loss_pct": 0.0,
+      "ecmp_routes": 8,
+      "failure_to_verified_ping_ms": 417.0848119999846,
+      "restoration": "passed",
+      "partition_and_healing": "passed",
+      "controller_takeover_ms": 5693.819760999986,
+      "failure_after_takeover": "passed",
+      "former_primary_restart": "passed",
+      "final_loss_pct": 0.0,
+      "recovery_events": 158,
+      "openflow_errors": 0,
+      "status": "passed"
+    },
+    {
+      "topology": "fattree",
+      "baseline_loss_pct": 0.0,
+      "ecmp_routes": 224,
+      "failure_to_verified_ping_ms": 425.3074389999938,
+      "restoration": "passed",
+      "partition_and_healing": "passed",
+      "controller_takeover_ms": 8025.064761000067,
+      "failure_after_takeover": "passed",
+      "former_primary_restart": "passed",
+      "final_loss_pct": 0.0,
+      "recovery_events": 1000,
+      "openflow_errors": 0,
+      "status": "passed"
+    }
+  ],
+  "chaos": {
+    "topology": "mesh",
+    "baseline_loss_pct": 0.0,
+    "final_loss_pct": 0.0,
+    "num_failures": 3,
+    "ping_interval_ms": 20.0,
+    "mean_controller_enqueue_ms": 1.0722923333332801,
+    "p95_controller_enqueue_ms": 1.5124855999829379,
+    "events": [
+      {
+        "link": [
+          3,
+          2
+        ],
+        "failure_ts": 1788576902.5736468,
+        "src_mac": "00:00:00:00:00:03",
+        "dst_mac": "00:00:00:00:00:06",
+        "ping": {
+          "sent": 220,
+          "received": 220,
+          "loss_pct": 0.0,
+          "max_reply_gap_ms": 40.44389724731445,
+          "recovered": true
+        },
+        "controller_enqueue_ms": [
+          1.1029999999436768
+        ]
+      },
+      {
+        "link": [
+          3,
+          1
+        ],
+        "failure_ts": 1788576907.6038496,
+        "src_mac": "00:00:00:00:00:03",
+        "dst_mac": "00:00:00:00:00:01",
+        "ping": {
+          "sent": 212,
+          "received": 212,
+          "loss_pct": 0.0,
+          "max_reply_gap_ms": 40.28582572937012,
+          "recovered": true
+        },
+        "controller_enqueue_ms": [
+          0.5558930000688633
+        ]
+      },
+      {
+        "link": [
+          5,
+          4
+        ],
+        "failure_ts": 1788576912.638394,
+        "src_mac": "00:00:00:00:00:06",
+        "dst_mac": "00:00:00:00:00:04",
+        "ping": {
+          "sent": 222,
+          "received": 221,
+          "loss_pct": 0.45045045045045046,
+          "max_reply_gap_ms": 59.48805809020996,
+          "recovered": true
+        },
+        "controller_enqueue_ms": [
+          1.5579839999873002
+        ]
+      }
+    ],
+    "passed": true
+  },
+  "reuse": {
+    "topology": "reuse",
+    "status": "passed",
+    "runs": [
+      {
+        "topology": "mesh",
+        "loss_pct": 0.0
+      },
+      {
+        "topology": "ring",
+        "loss_pct": 0.0
+      },
+      {
+        "topology": "fattree",
+        "loss_pct": 0.0
+      }
+    ]
+  }
+}

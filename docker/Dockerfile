@@ -1,27 +1,14 @@
 FROM ubuntu:22.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip \
-    mininet \
-    openvswitch-switch \
-    tshark \
-    iperf \
-    curl \
-    iproute2 \
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 EVENTLET_NO_GREENDNS=yes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
-
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" PYTHONPATH=/app
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
-
+RUN pip install --no-cache-dir pip==24.0 setuptools==57.5.0 wheel==0.42.0 \
+    && pip install --no-cache-dir --no-build-isolation -r requirements.txt
 COPY . .
-
-# Ensure ryu_controller is importable
-ENV PYTHONPATH=/app
-
-EXPOSE 6633 6634 5000 8000
-
-CMD ["ryu-manager", "--observe-links", "ryu_controller/sdn_controller.py"]
+EXPOSE 6633 5000
+CMD ["python", "start_ryu.py"]

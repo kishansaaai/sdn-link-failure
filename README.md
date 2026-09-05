@@ -1,177 +1,181 @@
-# SDN Link-Failure Recovery with Dijkstra Rerouting + Controller HA
+# SDN link-failure recovery
 
-[![Tests](https://github.com/kishansaaai/sdn-link-failure/actions/workflows/tests.yml/badge.svg)](https://github.com/kishansaaai/sdn-link-failure/actions/workflows/tests.yml)
-[![Lint](https://github.com/kishansaaai/sdn-link-failure/actions/workflows/lint.yml/badge.svg)](https://github.com/kishansaaai/sdn-link-failure/actions/workflows/lint.yml)
-[![codecov](https://codecov.io/gh/kishansaaai/sdn-link-failure/branch/main/graph/badge.svg)](https://codecov.io/gh/kishansaaai/sdn-link-failure)
+A working OpenFlow 1.3 lab with weighted routing, ECMP groups, automatic link
+recovery, Redis-backed controller failover, a read-only API and Prometheus/Grafana.
 
----
+The controller runs on **Python 3.10**. Mininet requires Linux, root privileges
+and Open vSwitch. Ubuntu 22.04 is the reference installation. Windows users
+run the network inside WSL2; use the userspace datapath if the WSL kernel lacks
+the Open vSwitch module.
 
-## What This Is — And Why It's Interesting
+## Start the lab
 
-Most SDN student projects implement a learning switch: flood until you learn a MAC, then install a rule. When a link fails, either the flows time out and the switch relearns, or you wipe all flow tables and start over. Both approaches take 2–8 seconds per failure event.
+### Option A: Docker control plane + Linux Mininet
 
-This project does something different: it builds a **live, metric-weighted graph of the entire network topology** using LLDP discovery, runs **Dijkstra's algorithm** to pre-install optimal paths end-to-end (not switch-by-switch), and on any link failure **surgically replaces only the broken paths** — proactively installing new OF rules before the next packet arrives. The result is **sub-100ms data-plane failover** measured at the OpenFlow message level.
-
-It also adds the one thing almost no student SDN project touches: **controller high availability** — a primary and a backup controller sharing topology state via Redis, with automatic leader election when the primary dies.
-
----
-
-## Architecture
-
-```
-┌─────────────────── Control Plane ───────────────────────┐
-│                                                          │
-│   ┌─────────────────────┐     ┌──────────────────────┐  │
-│   │   Ryu Primary       │     │   Ryu Backup         │  │
-│   │   :6633 / :8000     │     │   :6634 / :8001      │  │
-│   │   role=PRIMARY      │────▶│   role=WATCHING      │  │
-│   └─────────┬───────────┘     └──────────┬───────────┘  │
-│             │ heartbeat TTL               │ polls        │
-│             ▼                             ▼              │
-│          ┌──────────────── Redis ───────────────────┐    │
-│          │  sdn:heartbeat (TTL=5s)                  │    │
-│          │  sdn:topology_state (JSON graph)          │    │
-│          └──────────────────────────────────────────┘    │
-│                                                          │
-│  Prometheus :9090  →  Grafana :3000                      │
-└─────────────────────┬────────────────────────────────────┘
-                      │ OpenFlow 1.3
-         ┌────────────▼────────────┐
-         │   Mininet Data Plane    │
-         │   s1─s2─s3─s4─s5─s1    │
-         │       cross-links       │
-         │  h1 h2  h3  h4  h5 h6  │
-         └─────────────────────────┘
-```
-
-**HA Design (3 sentences):** The primary controller writes a heartbeat key with a 5-second TTL to Redis every 2 seconds. The backup controller polls this key every second; if it expires, the backup loads the last-synced topology JSON from Redis and promotes itself to primary using OpenFlow role negotiation. This separates **control-plane failover time** (~2 s for TTL detection + state load) from **data-plane failover time** (~40 ms for path recomputation and flow installation).
-
----
-
-## Key Results
-
-| Topology | Failures | Mean Failover | p50 | p95 | Loss During Failure |
-|---|---|---|---|---|---|
-| Ring (4 sw) | 8 | **38 ms** | 35 ms | 68 ms | 4.2% |
-| Mesh (5 sw) | 11 | **42 ms** | 40 ms | 75 ms | 5.8% |
-| Fat-tree (k=4) | 14 | **55 ms** | 48 ms | 98 ms | 7.1% |
-
-**vs. naive flood-and-relearn:** 2–8 seconds recovery, 100% loss until relearn.
-
-> Full results and regeneration instructions: [`benchmarks/results.md`](benchmarks/results.md)
-
----
-
-## How to Run (One Command)
-
-> Requires Docker with Linux kernel support (Ubuntu/Debian recommended).
+From this directory:
 
 ```bash
-git clone https://github.com/kishansaaai/sdn-link-failure
-cd sdn-link-failure
-docker compose up
+docker compose up --build -d --wait
+python3 scripts/verify_stack.py
+sudo apt-get install -y mininet openvswitch-switch
+sudo python3 -m topologies.runner --topo mesh --ports 6633,6634
 ```
 
-| Service | URL |
+Compose starts Redis, two controllers, Prometheus and Grafana. The second
+command starts the actual data plane on the Linux host; **Compose alone does
+not create switches or hosts**. Both controller addresses must be reachable
+from the Mininet host. Ports are published on loopback by default.
+
+At the Mininet prompt:
+
+```text
+pingall
+link s1 s3 down
+pingall
+link s1 s3 up
+pingall
+exit
+```
+
+Allow a few seconds for discovery before the first ping. Ring and fat-tree
+are available through `--topo ring` and `--topo fattree`.
+
+| Service | Address |
 |---|---|
-| Grafana Dashboard | http://localhost:3000 (admin/admin) |
+| Primary API | http://localhost:5000/health |
+| Backup API | http://localhost:5001/health |
+| Topology / forwarding paths | /topology and /paths on either API |
+| Recovery events / metrics | /recovery-log and /metrics on either API |
 | Prometheus | http://localhost:9090 |
-| REST API — Topology | http://localhost:5000/topology |
-| REST API — Recovery Log | http://localhost:5000/recovery-log |
-| Primary Metrics | http://localhost:8000/metrics |
+| Grafana | http://localhost:3000 — admin/admin for this local lab |
 
-### Bare-metal (Ubuntu + Mininet)
+Set `GRAFANA_ADMIN_PASSWORD` before the first Grafana startup to choose another
+password. Stop the control plane with `docker compose down`.
+
+### Option B: native controller
 
 ```bash
-# Terminal 1 — Primary controller
-ryu-manager --observe-links ryu_controller/sdn_controller.py
+sudo apt-get update
+sudo apt-get install -y python3.10-venv mininet openvswitch-switch redis-server
+bash setup_wsl.sh
+.venv/bin/python start_ryu.py
+```
 
-# Terminal 2 — Mininet
-sudo python3 topologies/mesh_topo.py
+In a second terminal:
 
-# Run chaos test
+```bash
+sudo python3 -m topologies.runner --topo mesh
+```
+
+The default is standalone mode and needs no Redis. The supported launcher
+handles Ryu's old Eventlet import and forwards Ryu command-line flags.
+Do not use `--observe-links`: this application owns discovery and gates all
+discovery packets on the leader lease.
+
+For native HA, run both processes and connect Mininet to both ports:
+
+```bash
+CONTROLLER_ROLE=primary OF_PORT=6633 API_PORT=5000 .venv/bin/python start_ryu.py
+CONTROLLER_ROLE=backup OF_PORT=6634 API_PORT=5001 .venv/bin/python start_ryu.py
+# In another terminal:
+sudo python3 -m topologies.runner --topo mesh --ports 6633,6634
+```
+
+Redis defaults to 127.0.0.1:6379. Override with `REDIS_HOST` and `REDIS_PORT`.
+These two commands belong in separate terminals. In HA mode a Redis outage
+withdraws controller writes; it never silently enables standalone mode.
+
+### WSL2
+
+Install Python 3.10 in your Ubuntu distribution before running `setup_wsl.sh`.
+On distributions without a Python 3.10 package, use the Docker controller
+image (built on Ubuntu 22.04) or an Ubuntu 22.04 WSL distribution.
+
+If the OVS kernel module is missing, start its userspace daemon and use:
+
+```bash
+sudo ovs-vswitchd --pidfile --detach --log-file  # only if no daemon is running
+sudo python3 -m topologies.runner --topo mesh --datapath user --unshaped
+```
+
+The userspace mode requires /dev/net/tun. `--unshaped` disables bandwidth
+emulation; results from that mode are functional checks, not capacity tests.
+
+## Verify the complete system
+
+Unit/regression tests use real OpenFlow encoders plus an in-memory Redis
+implementation executing the lease Lua scripts:
+
+```bash
+.venv/bin/python -m pytest
+.venv/bin/ruff check .
+.venv/bin/mypy ryu_controller/topology_graph.py ha --ignore-missing-imports
+```
+
+The real-switch integration suite starts its own two controllers and Redis
+on ports 16633/16634, 15000/15001 and 16379. Run it when no other Mininet lab
+is using these switch names:
+
+```bash
+sudo python3 tests/integration_lab.py --controller-python "$PWD/.venv/bin/python"
+# WSL without the OVS kernel module:
+sudo python3 tests/integration_lab.py --controller-python "$PWD/.venv/bin/python" --datapath user
+```
+
+It verifies all-pairs connectivity, ECMP routes, a used link failing, complete
+partition and healing, killing the active controller, another link failure
+after takeover, restarting the former primary, and reusing a controller across
+different topologies. Logs and JSON results go
+to `benchmarks/live/`. GitHub Actions runs these checks and builds/starts the
+Compose stack.
+
+Recovery checks wait up to ten seconds for three consecutive successful pings
+and retain every preceding probe's sent/received counts. Baseline and final
+all-pairs checks require zero loss without retries.
+
+For continuous packet sampling against an already running standalone controller:
+
+```bash
 sudo python3 chaos_test.py --topo mesh --duration 60
+# Use --api http://localhost:5001 if the backup currently owns the lease.
 ```
 
----
+The chaos runner owns its Mininet topology and stops it even if a test fails.
+It samples a flow whose installed path actually uses the failed link, verifies
+packet delivery while that link stays down, and saves per-event measurements.
 
-## REST API
+## What is implemented
 
-The controller exposes a lightweight Flask API in a background thread:
+- LLDP discovery and immediate OpenFlow port-down handling; silent links expire.
+- Source learning from ARP/broadcasts and direct, loop-free replication to
+  reachable access ports. Cycles do not require spanning-tree blocking.
+- Weighted Dijkstra and up to four near-equal paths. SELECT groups are referenced
+  by flows at every branch; all next hops decrease distance to the destination.
+- Affected-route replacement, group cleanup, unreachable-state reporting,
+  restoration, host moves and switch disconnects.
+- Port-stat deltas calculate TX utilization and loss using packet counters.
+  Costs use remaining bandwidth. Capacity defaults to 100 Mbps and is configurable
+  with `LINK_CAPACITY_MBPS`; latency is a configured graph metric (default 1 ms),
+  **not a claimed one-way LLDP latency measurement**.
+- Redis owner-checked leases, periodic state/intent snapshots, monotonically
+  increasing OpenFlow generations and master/slave role negotiation.
+- Serializable API responses, bounded recovery logs, per-process metric registries,
+  and a provisioned Grafana dashboard.
 
-```bash
-# Live topology as JSON
-curl http://localhost:5000/topology
+## Measurement and scope
 
-# Measured failover events
-curl http://localhost:5000/recovery-log
-```
+`recovery_ms` is controller computation plus message enqueue time. It is not
+switch acknowledgement or end-to-end packet recovery. Continuous ping results
+have an explicit sampling interval and count leading/trailing outages.
+The old simulated/unsupported performance table has been removed; see
+[validated results](benchmarks/results.md).
 
-**Example recovery-log output:**
-```json
-[
-  {
-    "src_mac": "00:00:00:00:00:01",
-    "dst_mac": "00:00:00:00:00:05",
-    "reason": "failure",
-    "recovery_ms": 42.3,
-    "new_path": [1, 5, 4, 3],
-    "ts": 1720000000.123
-  }
-]
-```
+This is a dedicated single-tenant L2 research lab: switches' group tables are
+reconciled on controller takeover, Redis is a single coordination dependency,
+and OpenFlow 1.3 updates are not atomic across switches. It is not a production
+HA cluster or a guaranteed sub-100ms recovery system. Multi-tenant VLAN routing,
+parallel links between the same switch pair, P4 and real-hardware timing are
+outside this implementation.
 
----
-
-## Why This Is Not a Flood-and-Relearn Switch
-
-| Capability | L2 Learning Switch | This Controller |
-|---|---|---|
-| Path computation | Per-hop, reactive | Global Dijkstra, proactive |
-| Failure response | Wait for timeout / wipe all rules | Surgical delete + instant reinstall |
-| Recovery time | 2–8 seconds | 35–55 ms |
-| Link cost metric | None (hop count) | Latency + bandwidth + loss rate |
-| Traffic engineering | None | Proactive rebalancing at >75% utilization |
-| Load balancing | None | ECMP via OF1.3 Group Tables |
-| Controller HA | None | Primary/backup with Redis state sync |
-| Observability | None | Prometheus + Grafana, per-link gauges |
-
----
-
-## Design Decisions & Tradeoffs
-
-**Why Ryu over ONOS / OpenDaylight?**  
-ONOS and ODL are production-grade platforms with clustered state, intent frameworks, and hundreds of thousands of lines of code. For a research/portfolio project validating a specific algorithm, Ryu gives direct access to the OpenFlow message layer with minimal overhead. ONOS would be the right choice if you needed to operate at carrier scale with real hardware.
-
-**Why Redis over etcd / ZooKeeper for state sync?**  
-etcd and ZooKeeper provide strong consistency guarantees (Raft consensus) which are essential when many controllers must agree on cluster state. Here, we have exactly two nodes (primary + one backup) and the state is eventually consistent by design — if the primary dies between two heartbeats, the backup may load topology state that is up to 2 seconds stale, which is acceptable because switches will re-advertise link events on reconnect. Redis's TTL-based expiry maps perfectly to the heartbeat pattern with zero configuration overhead.
-
-**What I'd do differently at larger scale:**  
-At 500+ switches, the centralized Dijkstra computation on every topology change becomes a bottleneck. I'd move to a hierarchical controller design (ONOS clusters with regional sub-controllers), switch to a distributed graph store (Apache TinkerPop / JanusGraph), and implement segment routing (SR-MPLS or SRv6) to encode paths in packet headers rather than installing per-flow rules on every switch.
-
----
-
-## Future Work
-
-- **P4 dataplane**: Move failure detection into the dataplane using P4 registers and INT (In-band Network Telemetry) — eliminates the controller round-trip entirely for detection.
-- **Real hardware**: Test on a Zodiac FX OpenFlow switch or BMv2 software switch with a physical NIC for accurate latency measurements.
-- **Inter-domain failover**: BGP-like route redistribution between SDN islands — relevant for multi-datacenter deployments.
-- **ML-based traffic prediction**: Replace the fixed 75% utilization threshold with an LSTM model predicting link congestion 30 seconds ahead.
-
----
-
-## Proof of Execution
-
-- **`benchmarks/results.md`** — measured failover times across three topologies
-- **`cn-screenshots.pdf`** — original v1 POX prototype screenshots
-- **`legacy/`** — preserved v1 POX controller showing the engineering evolution
-
----
-
-## References
-
-- [Ryu SDN Framework](https://ryu-sdn.org/)
-- [OpenFlow 1.3 Specification](https://opennetworking.org/wp-content/uploads/2014/10/openflow-spec-v1.3.0.pdf)
-- [Mininet](http://mininet.org)
-- [Dijkstra's Algorithm — Original Paper](https://doi.org/10.1007/BF01386390)
-- [Fat-Tree Topology — Al-Fares et al. 2008](https://dl.acm.org/doi/10.1145/1402958.1402967)
+Architecture and failure behavior: [ARCHITECTURE.md](ARCHITECTURE.md).
+The historical POX version and its API are preserved in [legacy/](legacy/).

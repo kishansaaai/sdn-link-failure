@@ -1,79 +1,73 @@
-version: "3.9"
-
 services:
   redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 20
     restart: unless-stopped
 
   ryu-primary:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    command: >
-      ryu-manager
-        --observe-links
-        ryu_controller/sdn_controller.py
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - OF_PORT=6633
-      - CONTROLLER_ROLE=primary
+      REDIS_HOST: redis
+      CONTROLLER_ROLE: primary
     ports:
-      - "6633:6633"    # OpenFlow
-      - "8000:8000"    # Prometheus metrics
-      - "5000:5000"    # REST API
+      - "127.0.0.1:6633:6633"
+      - "127.0.0.1:5000:5000"
     depends_on:
-      - redis
-    privileged: true
-    network_mode: host
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
     restart: unless-stopped
 
   ryu-backup:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    command: >
-      ryu-manager
-        --observe-links
-        ryu_controller/sdn_controller.py
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - OF_PORT=6634
-      - CONTROLLER_ROLE=backup
+      REDIS_HOST: redis
+      CONTROLLER_ROLE: backup
     ports:
-      - "6634:6634"    # OpenFlow (backup listens on different port)
-      - "8001:8000"    # Prometheus metrics (backup)
+      - "127.0.0.1:6634:6633"
+      - "127.0.0.1:5001:5000"
     depends_on:
-      - redis
-      - ryu-primary
-    privileged: true
-    network_mode: host
+      redis:
+        condition: service_healthy
+      ryu-primary:
+        condition: service_healthy
     restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.2.1
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
-    depends_on:
-      - ryu-primary
+      - "127.0.0.1:9090:9090"
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.6.0
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - ./docker/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
       - ./docker/grafana/dashboard.json:/etc/grafana/provisioning/dashboards/dashboard.json:ro
       - ./docker/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
     ports:
-      - "3000:3000"
-    depends_on:
-      - prometheus
+      - "127.0.0.1:3000:3000"
     restart: unless-stopped
+
+volumes:
+  redis-data:
