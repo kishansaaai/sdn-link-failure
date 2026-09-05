@@ -213,3 +213,12 @@ def test_disconnect_removes_switch_and_routes(controller):
     c.disconnect_handler(SimpleNamespace(datapath=c.dpid_conns[4]))
     assert 4 not in c.graph.adj
     assert KEY not in c.active_paths
+
+def test_switch_reconnect_does_not_retain_previous_port_roles(controller):
+    c = controller
+    c.port_prev_stats[(1, 1)] = (0, (1, 2, 3))
+    c.link_seen[(1, 2)] = 1
+    c.disconnect_handler(SimpleNamespace(datapath=c.dpid_conns[1]))
+    assert all(key[0] != 1 for key in c.trunk_ports)
+    assert all(key[0] != 1 for key in c.port_prev_stats)
+    assert all(1 not in edge for edge in c.link_seen)

@@ -171,10 +171,46 @@ def run_topology(name, python, datapath, output_dir):
             handle.close()
 
 
+def run_reuse(python, datapath, output_dir):
+    """Reuse identical switch IDs/port numbers across different topologies."""
+    log_path = output_dir / "reuse-controller.log"
+    env = {**os.environ, "CONTROLLER_ROLE": "standalone", "OF_PORT": "16635",
+           "API_PORT": "15002", "PYTHONPATH": str(ROOT)}
+    with log_path.open("w") as handle:
+        process = subprocess.Popen([python, "start_ryu.py"], cwd=ROOT, env=env,
+                                   stdout=handle, stderr=subprocess.STDOUT)
+        results = []
+        try:
+            wait_for(lambda: get_json(15002, "health")["role"] == "primary")
+            for name in ("mesh", "ring", "fattree"):
+                net = create_network(name, ports=(16635,), datapath=datapath, shaped=False)
+                try:
+                    net.start()
+                    expected = sum(link.intf1.node in net.switches and link.intf2.node in net.switches
+                                   for link in net.links) * 2
+                    wait_for(lambda: sum(len(n) for n in get_json(15002, "topology")["adj"].values()) == expected,
+                             message=f"reused controller discovers {name}")
+                    loss = net.pingAll(timeout="1")
+                    assert loss == 0, f"Reusing controller for {name}: {loss}% loss"
+                    results.append({"topology": name, "loss_pct": loss})
+                finally:
+                    net.stop()
+                wait_for(lambda: get_json(15002, "health")["switches"] == 0,
+                         message="old switch sessions close")
+            return {"topology": "reuse", "status": "passed", "runs": results}
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--controller-python", default=str(ROOT / ".venv/bin/python"))
-    parser.add_argument("--topo", choices=["ring", "mesh", "fattree", "all"], default="all")
+    parser.add_argument("--topo", choices=["ring", "mesh", "fattree", "reuse", "all"], default="all")
     parser.add_argument("--datapath", choices=["kernel", "user"], default="kernel")
     parser.add_argument("--output-dir", default="benchmarks/live")
     args = parser.parse_args()
@@ -186,8 +222,14 @@ def main():
     results = []
     for name in names:
         print(f"Testing {name}", flush=True)
-        results.append(run_topology(name, args.controller_python, args.datapath, output))
+        if name == "reuse":
+            results.append(run_reuse(args.controller_python, args.datapath, output))
+        else:
+            results.append(run_topology(name, args.controller_python, args.datapath, output))
         print(json.dumps(results[-1], indent=2), flush=True)
+        (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    if args.topo == "all":
+        results.append(run_reuse(args.controller_python, args.datapath, output))
         (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
 
 

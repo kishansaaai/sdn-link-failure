@@ -20,6 +20,10 @@ partition and healing, active-controller termination, recovery on the backup,
 a new link failure after takeover, and the former primary restarting as standby.
 There were no unexpected OpenFlow errors in these runs.
 
+A separate reuse test kept one controller alive while replacing mesh with ring
+and then fat-tree networks. All three first-pass all-pairs checks had 0% loss,
+verifying that previous switch-port classifications do not leak into a new lab.
+
 The time from killing the primary until takeover and three successful test pings
 was 5.71 s (ring), 5.69 s (mesh), and 8.03 s (fat-tree). These values include
 the five-second lease, readiness polling, reconciliation and ping verification.

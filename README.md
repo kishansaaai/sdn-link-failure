@@ -16,6 +16,7 @@ From this directory:
 
 ```bash
 docker compose up --build -d --wait
+python3 scripts/verify_stack.py
 sudo apt-get install -y mininet openvswitch-switch
 sudo python3 -m topologies.runner --topo mesh --ports 6633,6634
 ```
@@ -123,7 +124,8 @@ sudo python3 tests/integration_lab.py --controller-python "$PWD/.venv/bin/python
 
 It verifies all-pairs connectivity, ECMP routes, a used link failing, complete
 partition and healing, killing the active controller, another link failure
-after takeover, and restarting the former primary. Logs and JSON results go
+after takeover, restarting the former primary, and reusing a controller across
+different topologies. Logs and JSON results go
 to `benchmarks/live/`. GitHub Actions runs these checks and builds/starts the
 Compose stack.
 

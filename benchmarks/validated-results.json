@@ -122,5 +122,23 @@
       }
     ],
     "passed": true
+  },
+  "reuse": {
+    "topology": "reuse",
+    "status": "passed",
+    "runs": [
+      {
+        "topology": "mesh",
+        "loss_pct": 0.0
+      },
+      {
+        "topology": "ring",
+        "loss_pct": 0.0
+      },
+      {
+        "topology": "fattree",
+        "loss_pct": 0.0
+      }
+    ]
   }
 }

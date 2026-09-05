@@ -14,3 +14,4 @@ venv310/
 benchmarks/*_results.json
 benchmarks/live/
 benchmarks/verified-chaos/
+benchmarks/reuse-check/

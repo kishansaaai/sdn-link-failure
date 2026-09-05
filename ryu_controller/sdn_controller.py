@@ -179,6 +179,11 @@ class SDNController(app_manager.RyuApp):
         self.dpid_conns.pop(dpid, None)
         self.ready.discard(dpid)
         self.ports.pop(dpid, None)
+        self.trunk_ports = {key for key in self.trunk_ports if key[0] != dpid}
+        self.port_prev_stats = {key: value for key, value in self.port_prev_stats.items()
+                                if key[0] != dpid}
+        for neighbor in list(self.graph.adj.get(dpid, {})):
+            self._remove_link(dpid, neighbor)
         self.graph.remove_switch(dpid)
         self._recompute(reason="switch_failure")
 
@@ -199,6 +204,7 @@ class SDNController(app_manager.RyuApp):
         down = ev.msg.reason == dp.ofproto.OFPPR_DELETE or not self._port_up(dp, desc)
         if ev.msg.reason == dp.ofproto.OFPPR_DELETE:
             self.ports.get(dp.id, {}).pop(desc.port_no, None)
+            self.trunk_ports.discard((dp.id, desc.port_no))
         else:
             self.ports.setdefault(dp.id, {})[desc.port_no] = desc
         if down:
